@@ -10,11 +10,16 @@ portable and dependency-free:
     nodes that cannot be given a distinct address are drained (stopped)
   * health = a dead node is restarted; a drained node stays down until revived
 
-Runs on Linux and Windows with stdlib only (wireproxy does the WireGuard side in
-userspace, SOCKS5 mode — no admin, no TUN, no Docker).
+The tunnel is Cloudflare WARP over MASQUE (usque, HTTP/2 over TCP 443), not
+WireGuard-over-UDP 2408: UDP to Cloudflare is blackholed on Iranian ISPs, so a
+WireGuard handshake never comes back — TCP/443 does. Per-node distinct egress
+comes from one usque registration each.
+
+Runs on Linux and Windows with stdlib only (usque does the tunnel in userspace,
+SOCKS5 mode — no admin, no TUN, no Docker).
 
 Commands:
-  warppool.py init            write config.json + download wireproxy if missing
+  warppool.py init            write config.json + download usque if missing
   warppool.py up              start every non-drained node
   warppool.py down            stop every node
   warppool.py ensure          health + dedupe + rotate-due  (cron entrypoint)
@@ -35,14 +40,12 @@ DEFAULTS = {
     "base_port": 18090,
     "rotate_interval_s": 300,     # same cadence as the reference project
     "measure_url": "https://www.cloudflare.com/cdn-cgi/trace",
-    "upstream_proxy": "",         # e.g. socks5://127.0.0.1:10808 (Iran: your v2ray)
-    "wg_endpoint_override": "",   # e.g. 127.0.0.1:10809 (v2ray dokodemo UDP relay)
-    "wireproxy_bin": "",          # auto: ./bin/wireproxy(.exe)
+    "usque_bin": "",              # auto: ./bin/usque(.exe)
+    "usque_dns": "1.1.1.1",       # inside-tunnel resolver; the defaults stall under HTTP/2
     "ui_bind": "127.0.0.1",
     "ui_port": 8180,
     "nine_router": {"enabled": False, "base_url": "http://127.0.0.1:20128",
                     "cli_token": "", "pool_prefix": "warp-"},
-    "cf_client_version": "a-6.81-2410032352.1",
     "reg_backoff_s": [60, 120],   # CF 429/403: long backoff (their own lesson)
 }
 
@@ -65,49 +68,9 @@ def load_state():
 def save_state(st):
     json.dump(st, open(STATE_PATH, "w"), indent=1)
 
-# ---------------------------------------------------------------- x25519 (RFC 7748)
-_P = 2**255 - 19
-_A24 = 121665
-def _clamp(k: bytes) -> int:
-    v = int.from_bytes(k, "little")
-    v &= ~7; v &= ~(127 << 255); v |= 64 << 254
-    return v
-def _x25519(k: bytes, u: bytes) -> bytes:
-    k = _clamp(k); x1 = int.from_bytes(u, "little") % _P
-    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
-    for t in reversed(range(255)):
-        kt = (k >> t) & 1; swap ^= kt
-        if swap: x2, x3 = x3, x2; z2, z3 = z3, z2
-        swap = kt
-        A = (x2 + z2) % _P; AA = A * A % _P
-        B = (x2 - z2) % _P; BB = B * B % _P
-        E = (AA - BB) % _P
-        C = (x3 + z3) % _P; D = (x3 - z3) % _P
-        DA = D * A % _P; CB = C * B % _P
-        x3 = (DA + CB) ** 2 % _P
-        z3 = x1 * ((DA - CB) ** 2 % _P) % _P
-        x2 = AA * BB % _P
-        z2 = E * (AA + _A24 * E) % _P
-    if swap: x2, x3 = x3, x2; z2, z3 = z3, z2
-    inv = pow(z2, _P - 2, _P)
-    return (x2 * inv % _P).to_bytes(32, "little")
-def keypair():
-    priv = os.urandom(32)
-    return base64.b64encode(priv).decode(), base64.b64encode(_x25519(priv, b"\x09" + b"\x00"*31)).decode()
-def selftest_x25519():
-    # RFC 7748 §5.2 vector 1
-    k = bytes.fromhex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4")
-    u = bytes.fromhex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c")
-    e = bytes.fromhex("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552")
-    return _x25519(k, u) == e
-
 # ---------------------------------------------------------------- io helpers
 def opener(cfg, timeout=20):
-    handlers = []
-    if cfg.get("upstream_proxy"):
-        handlers.append(urllib.request.ProxyHandler({
-            "http": cfg["upstream_proxy"], "https": cfg["upstream_proxy"]}))
-    return urllib.request.build_opener(*handlers), timeout
+    return urllib.request.build_opener(), timeout
 
 def http_json(cfg, url, data=None, headers=None, method=None, timeout=20):
     body = json.dumps(data).encode() if isinstance(data, (dict, list)) else data
@@ -126,30 +89,26 @@ def fetch_text(cfg, url, timeout=20):
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# ---------------------------------------------------------------- wireproxy
-def wbin(cfg):
-    p = cfg.get("wireproxy_bin") or os.path.join(HERE, "bin", "wireproxy.exe" if WIN else "wireproxy")
-    return p
+# ---------------------------------------------------------------- usque (WARP over MASQUE)
+# WireGuard on UDP 2408 is blackholed on Iranian ISPs (handshake never returns);
+# usque carries WARP in MASQUE over TCP 443 via --http2. One registration per node.
+def ubin(cfg):
+    return cfg.get("usque_bin") or os.path.join(HERE, "bin", "usque.exe" if WIN else "usque")
 
-def download_wireproxy(cfg):
-    if os.path.exists(wbin(cfg)):
-        return wbin(cfg)
-    plat = "wireproxy_windows_amd64.tar.gz" if WIN else "wireproxy_linux_amd64.tar.gz"
-    # octeep/wireproxy moved to repo id 468743437; follow the redirect
-    url = f"https://api.github.com/repositories/468743437/releases/latest"
-    _, rel = http_json(cfg, url)
-    asset = next(a for a in rel["assets"] if a["name"] == plat)
-    os.makedirs(os.path.dirname(wbin(cfg)), exist_ok=True)
-    import tarfile, io
-    data = fetch_text_cfg(cfg, asset["browser_download_url"])
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-        for m in tf.getmembers():
-            if os.path.basename(m.name) == ("wireproxy.exe" if WIN else "wireproxy"):
-                m.name = os.path.basename(m.name)
-                tf.extract(m, os.path.dirname(wbin(cfg)))
+def download_usque(cfg):
+    if os.path.exists(ubin(cfg)):
+        return ubin(cfg)
+    plat = "windows_amd64" if WIN else "linux_amd64"
+    _, rel = http_json(cfg, "https://api.github.com/repos/Diniboy1123/usque/releases/latest")
+    asset = next(a for a in rel["assets"] if f"_{plat}.zip" in a["name"])
+    os.makedirs(os.path.dirname(ubin(cfg)), exist_ok=True)
+    import zipfile, io
+    with zipfile.ZipFile(io.BytesIO(fetch_text_cfg(cfg, asset["browser_download_url"]))) as z:
+        m = next(n for n in z.namelist() if os.path.basename(n) in ("usque.exe", "usque"))
+        open(ubin(cfg), "wb").write(z.read(m))
     if not WIN:
-        os.chmod(wbin(cfg), 0o755)
-    return wbin(cfg)
+        os.chmod(ubin(cfg), 0o755)
+    return ubin(cfg)
 
 def fetch_text_cfg(cfg, url, timeout=60):
     op, to = opener(cfg, timeout)
@@ -157,70 +116,31 @@ def fetch_text_cfg(cfg, url, timeout=60):
         return r.read()
 
 def conf_path(cfg, port):
-    return os.path.join(HERE, "nodes", f"node-{port}.conf")
-
-def write_conf(cfg, port, priv, endpoint, peer_pub, v4, v6):
-    os.makedirs(os.path.dirname(conf_path(cfg, port)), exist_ok=True)
-    open(conf_path(cfg, port), "w").write(f"""[Interface]
-PrivateKey = {priv}
-Address = {v4}/32
-Address = {v6}/128
-DNS = 1.1.1.1
-MTU = 1280
-
-[Peer]
-PublicKey = {peer_pub}
-AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = {endpoint}
-PersistentKeepalive = 30
-
-[Socks5]
-BindAddress = 127.0.0.1:{port}
-""")
+    """Each node is a directory: usque keeps its config.json in the cwd unless -c says otherwise."""
+    return os.path.join(HERE, "nodes", f"node-{port}", "config.json")
 
 def register(cfg, port):
-    """Fresh WARP device -> its own egress address. Backs off hard on 429/403."""
-    priv, pub = keypair()
-    sn = str(__import__("uuid").uuid4())
-    tos = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
-    payload = {"install_id": "", "tos": tos, "key": pub, "fcm_token": "",
-               "serial_number": sn, "type": "Android", "model": "PC", "locale": "en_US"}
-    tries = 3
-    for i in range(tries):
-        try:
-            status, d = http_json(cfg, "https://api.cloudflareclient.com/v0a2483/reg",
-                                  payload, headers={"CF-Client-Version": cfg["cf_client_version"]}, timeout=25)
-        except urllib.error.HTTPError as e:
-            status, d = e.code, {}
-            try: d = json.loads(e.read())
-            except Exception: pass
-        except Exception as e:
-            log(f"register {port}: transport {e}"); time.sleep(5); continue
-        if status == 200 and "config" in d:
-            cf = d["config"]; peer = cf["peers"][0]
-            ep = cfg.get("wg_endpoint_override") or peer["endpoint"]["host"]
-            write_conf(cfg, port, priv, ep, peer["public_key"],
-                       cf["interface"]["addresses"]["v4"], cf["interface"]["addresses"]["v6"])
-            return {"id": d.get("id"), "registered_at": time.time()}
-        if status in (429, 400, 403):
+    """Fresh WARP device -> its own egress address. usque owns the whole dance:
+    registration, HTTPS enrol, MASQUE switch. Backs off hard on 429/403."""
+    os.makedirs(os.path.dirname(conf_path(cfg, port)), exist_ok=True)
+    # register into a temp path: usque asks "overwrite? (y/n)" when the config
+    # exists, and a prompt-less subprocess dies on the EOF
+    tmp = conf_path(cfg, port) + ".new"
+    for i in range(3):
+        r = subprocess.run([ubin(cfg), "register", "-a", "-c", tmp],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and os.path.exists(tmp):
+            os.replace(tmp, conf_path(cfg, port))
+            return {"id": os.path.basename(os.path.dirname(conf_path(cfg, port))), "registered_at": time.time()}
+        err = (r.stderr or r.stdout).strip().splitlines()
+        log(f"register {port}: {(err[-1] if err else 'no output')[:160]}")
+        if any(x in (r.stdout + r.stderr) for x in ("429", "403", "rate")):
             wait = random.choice(cfg["reg_backoff_s"]) + random.randint(0, 60)
-            log(f"register {port}: HTTP {status} — long backoff {wait}s (CF rate limit)")
-            time.sleep(min(wait, 90)); continue
-        time.sleep(4 + i * 6)
+            log(f"register {port}: CF rate limit - backoff {wait}s")
+            time.sleep(min(wait, 90))
+        else:
+            time.sleep(4 + i * 6)
     return None
-
-def pid_alive(cfg, port):
-    st = load_state().get("nodes", {}).get(str(port)) or {}
-    p = st.get("pid")
-    if not p: return False
-    try:
-        if WIN:
-            # os.kill on windows with 0 is unreliable; probe the socks port instead
-            return sock_open(port)
-        os.kill(int(p), 0)
-        return True
-    except (OSError, ValueError):
-        return False
 
 def sock_open(port, host="127.0.0.1", timeout=1.5):
     try:
@@ -230,34 +150,32 @@ def sock_open(port, host="127.0.0.1", timeout=1.5):
 
 def spawn(cfg, port, st=None):
     # truncate node log each spawn: it only captures last crash, not history
+    lp = os.path.join(HERE, "nodes", f"node-{port}.log")
     try:
-        lp = os.path.join(HERE, "nodes", f"node-{port}.log")
         if os.path.exists(lp) and os.path.getsize(lp) > 200_000:
             with open(lp, "rb") as f: tail = f.read()[-50_000:]
             with open(lp, "wb") as f: f.write(tail)
     except OSError:
         pass
-    logf = open(os.path.join(HERE, "nodes", f"node-{port}.log"), "ab")
+    logf = open(lp, "ab")
     kw = {"stdout": logf, "stderr": logf}
     if not WIN: kw["start_new_session"] = True
-    # Go GC knobs: soft heap ceiling keeps idle wireproxy RSS flat instead of
-    # drifting up with allocations; GOGC=50 trades negligible GC CPU (~2% of a
-    # mostly-idle 0.3% baseline) for a smaller resident set. Performance of
-    # proxied traffic is unaffected (kernel path is the overhead).
-    env = {**os.environ, "GOGC": "50", "GOMEMLIMIT": "32MiB"}
-    p = subprocess.Popen([wbin(cfg), "-c", conf_path(cfg, port)], env=env, **kw)
-    if st is None:
-        st = load_state()
-        st.setdefault("nodes", {}).setdefault(str(port), {"registered_at": 0, "drained": False})
+    # --http2: MASQUE over TCP+TLS/443. UDP/QUIC to Cloudflare is blocked on these
+    # ISPs, so the default QUIC path and l4-socks both hang.
+    p = subprocess.Popen([ubin(cfg), "socks", "--http2",
+                          "-b", "127.0.0.1", "-p", str(port), "-d", cfg.get("usque_dns") or "1.1.1.1",
+                          "-c", conf_path(cfg, port)], **kw)
+    if st is None: st = load_state()
+    st.setdefault("nodes", {}).setdefault(str(port), {"registered_at": 0, "drained": False})
     st["nodes"][str(port)]["pid"] = p.pid
-    if st is None:
-        save_state(st)
+    save_state(st)
     return p.pid
 
 def _find_proc(port):
-    """A slot whose stored pid is stale still owns a live wireproxy — find it
-    by its config path; register/rotate отчёт lie otherwise (bind: in use)."""
-    needle = f"node-{port}.conf".encode()
+    """A slot whose stored pid is stale still owns a live usque - find it by its
+    config path; register/rotate lie otherwise (bind: in use)."""
+    if WIN: return _find_proc_win(port)
+    needle = os.path.join("node-%s" % port, "config.json").encode()
     for pid in os.listdir("/proc"):
         if not pid.isdigit(): continue
         try:
@@ -265,51 +183,55 @@ def _find_proc(port):
         except OSError: pass
     return None
 
+def _find_proc_win(port):
+    """wmic is gone from Windows 11; CIM is the supported way to read command lines."""
+    needle = os.path.join("node-%s" % port, "config.json")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                              "(Get-CimInstance Win32_Process -Filter \"Name='usque.exe'\").ProcessId,"
+                              "(Get-CimInstance Win32_Process -Filter \"Name='usque.exe'\").CommandLine"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except Exception:
+        return None
+    # pairs come out as all PIDs then all command lines
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    pids  = [l for l in lines if l.isdigit()]
+    cmds  = [l for l in lines if not l.isdigit()]
+    for pid, cmd in zip(pids, cmds):
+        if needle in cmd: return int(pid)
+    return None
+
 def stop_node(port, st=None):
-    if st is None:
-        st = load_state()
+    if st is None: st = load_state()
     n = st.get("nodes", {}).get(str(port)) or {}
     p = n.get("pid") or _find_proc(port)
     if p:
         try:
             if WIN:
-                subprocess.run(["taskkill", "/PID", str(p), "/F"], capture_output=True)
+                subprocess.run(["taskkill", "/PID", str(p), "/F", "/T"], capture_output=True)
             else:
-                os.kill(int(p), signal.SIGTERM)          # Go daemons often ignore SIGTERM
+                os.kill(int(p), signal.SIGTERM)
                 time.sleep(0.6)
-                try: os.kill(int(p), 0)                   # still alive?
+                try: os.kill(int(p), 0)
                 except OSError: pass
                 else: os.kill(int(p), signal.SIGKILL)
-                # wait for the socks port to actually free: spawn would otherwise bind-fail
-                for _ in range(20):
+                for _ in range(20):   # wait for the socks port to actually free
                     try:
                         socket.create_connection(("127.0.0.1", int(port)), timeout=0.5).close()
-                        time.sleep(0.3)                   # still listening at PID level
                     except OSError:
                         break
                     time.sleep(0.3)
         except Exception:
             pass
     n.pop("pid", None)
-    # free the listener even if the pid was gone
     time.sleep(0.3)
-
 
 def adopt_pid(cfg, port, st):
     """Attach a pid to a node whose socks port answers but whose pid was lost."""
     n = st["nodes"][str(port)]
-    if n.get("pid") or not WIN:
-        if n.get("pid"): return
-        needle = f"node-{port}.conf".encode()
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit(): continue
-            try:
-                if needle in open(f"/proc/{pid}/cmdline", "rb").read():
-                    n["pid"] = int(pid); return
-            except OSError:
-                pass
-    else:
-        pass
+    if not n.get("pid"):
+        p = _find_proc(port)
+        if p: n["pid"] = p
 
 def measure(cfg, port):
     try:
@@ -323,7 +245,8 @@ def _measure_via_socks(cfg, port):
     if shutil.which("curl") is None:
         return {"error": "curl missing"}
     url = cfg["measure_url"] + "?r=" + str(random.randint(1, 1 << 30))
-    r = subprocess.run(["curl", "-sS", "-m", "15", "-x", f"socks5h://127.0.0.1:{port}", url],
+    # the MASQUE tunnel takes ~1s to establish on a cold node; 15s is too tight
+    r = subprocess.run(["curl", "-sS", "-m", "30", "-x", f"socks5h://127.0.0.1:{port}", url],
                        capture_output=True, text=True)
     out = dict(re.findall(r"^([a-z]+)=(.*)$", r.stdout, re.M))
     if "ip" not in out: return {"error": (r.stderr or r.stdout or "no trace")[:80]}
@@ -350,9 +273,9 @@ def ensure(cfg):
                     log(f"{port}: registration failed"); continue
                 n.update(r); changed.append(f"{port} registered")
             spawn(cfg, port, st)
-            time.sleep(1.5)
+            time.sleep(3)   # usque needs a moment to bind its socks listener
             if sock_open(int(port)): changed.append(f"{port} started")
-            else: log(f"{port}: wireproxy did not open its socks port")
+            else: log(f"{port}: usque did not open its socks port")
         elif not nodes[port].get("pid"):
             adopt_pid(cfg, port, st)
 
@@ -381,7 +304,7 @@ def ensure(cfg):
             r = register(cfg, int(p))
             if r:
                 nodes[p].update(r)
-                spawn(cfg, int(p), st); time.sleep(1.5)
+                spawn(cfg, int(p), st); time.sleep(3)
                 got = measure(cfg, int(p)).get("ip") if sock_open(int(p)) else None
                 nodes[p]["measure"] = {"ip": got, "warp": True} if got else {}
                 nodes[p]["measured_at"] = time.time()
@@ -400,7 +323,7 @@ def ensure(cfg):
             r = register(cfg, int(port))
             if r:
                 n.update(r); spawn(cfg, int(port), st)
-                time.sleep(1.5)
+                time.sleep(3)
                 got = measure(cfg, int(port)).get("ip") if sock_open(int(port)) else None
                 tries = 1
                 while old_ip and got == old_ip and tries < 3:
@@ -408,7 +331,7 @@ def ensure(cfg):
                     # same colo address back); we want a DIFFERENT quota bucket
                     stop_node(port, st); r = register(cfg, int(port))
                     if not r: break
-                    n.update(r); spawn(cfg, int(port), st); time.sleep(1.5); tries += 1
+                    n.update(r); spawn(cfg, int(port), st); time.sleep(3); tries += 1
                     got = measure(cfg, int(port)).get("ip") if sock_open(int(port)) else None
                 n["measure"] = {"ip": got, "warp": True} if got else {}
                 n["measured_at"] = time.time()
@@ -421,6 +344,11 @@ def ensure(cfg):
     drained = sum(1 for p in nodes if nodes[p].get("drained"))
     distinct = {n.get("measure", {}).get("ip") for n in nodes.values()
                 if not n.get("drained") and n.get("measure", {}).get("ip")}
+    if cfg.get("nine_router", {}).get("enabled"):
+        # publish here, not in the caller: every cycle (up / ensure / rotate) must
+        # leave 9router's pools created AND tested, or it reaps them
+        try: install_9r(cfg)
+        except Exception as e: log(f"9r install failed: {e}")
     return {"alive": alive, "drained": drained, "distinct_ips": len(distinct), "changed": changed}
 
 def status(cfg):
@@ -446,7 +374,8 @@ def install_9r(cfg):
     if not n9.get("cli_token"):
         # derive exactly like the box's documented 999 trigger does
         base = None
-        for cand in ("/opt/data/.9router", os.path.expanduser("~/.9router")):
+        for cand in ("/opt/data/.9router", os.path.expanduser("~/.9router"),
+                     os.path.join(os.environ.get("APPDATA") or "", "9router")):
             if os.path.exists(os.path.join(cand, "machine-id")): base = cand; break
         if base:
             n9["cli_token"] = hashlib.sha256((open(os.path.join(base, "machine-id")).read().strip() +
@@ -456,12 +385,24 @@ def install_9r(cfg):
     hdr = {"x-9r-cli-token": n9["cli_token"], "Content-Type": "application/json"}
     base = n9["base_url"]
     st, d = http_json(cfg, base + "/api/proxy-pools", headers=hdr, timeout=10)
-    have = {p.get("proxyUrl") for p in (d.get("proxyPools") or []) if p.get("proxyUrl")}
-    created = []
+    pools = d.get("proxyPools") or []
+    by_url = {p.get("proxyUrl"): p for p in pools if p.get("proxyUrl")}
+    created, retested = [], []
     for row in status(cfg):
         if row["state"] != "up": continue
         url = f"socks5://127.0.0.1:{row['port']}"
-        if url in have: continue
+        old = by_url.get(url)
+        if old:
+            # a pool for this node already exists — retest it: 9router reaps pools
+            # left untested, and a stale one still points at a dead node
+            pid = old.get("id")
+            if pid and old.get("testStatus") != "active":
+                try:
+                    http_json(cfg, f"{base}/api/proxy-pools/{pid}/test", {}, headers=hdr, timeout=30)
+                    retested.append(url)
+                except Exception as e:
+                    log(f"9r test {url}: {e}")
+            continue
         st2, res = http_json(cfg, base + "/api/proxy-pools",
                              {"name": f"{n9['pool_prefix']}{row['port']}", "proxyUrl": url,
                               "noProxy": "", "isActive": True, "strictProxy": False, "type": "http"},
@@ -472,7 +413,8 @@ def install_9r(cfg):
                 http_json(cfg, f"{base}/api/proxy-pools/{pid}/test", {}, headers=hdr, timeout=30)
             created.append(url)
         else: log(f"9r create {url}: HTTP {st2}")
-    log(f"9router: {len(created)} pool(s) created" + (f": {created}" if created else ""))
+    log(f"9router: {len(created)} created" + (f": {created}" if created else "") +
+        (f", {len(retested)} retested" if retested else ""))
     return created
 
 # ---------------------------------------------------------------- UI
@@ -502,8 +444,7 @@ def _public_cfg(cfg):
     """Config the UI needs, secrets omitted."""
     n9 = cfg.get("nine_router") or {}
     return {"nodes": cfg.get("nodes"), "rotate_interval_s": cfg.get("rotate_interval_s"),
-            "upstream_proxy": bool(cfg.get("upstream_proxy")),
-            "wg_endpoint_override": bool(cfg.get("wg_endpoint_override")),
+            "usque_dns": cfg.get("usque_dns"),
             "nine_router": {"enabled": bool(n9.get("enabled")), "base_url": n9.get("base_url"),
                             "connected": bool(n9.get("cli_token"))},
             "path": HERE}
@@ -543,7 +484,7 @@ def serve(cfg):
                     wrapper = {"nodes": st}
                     stop_node(p, wrapper); r = register(c, int(p))
                     if r:
-                        st[p].update(r); spawn(c, int(p), wrapper); time.sleep(1.5)
+                        st[p].update(r); spawn(c, int(p), wrapper); time.sleep(3)
                         got = measure(c, int(p)).get("ip") if sock_open(int(p)) else None
                         st[p]["measure"] = {"ip": got, "warp": True} if got else {}
                         st[p]["measured_at"] = time.time(); done.append(p)
@@ -552,12 +493,9 @@ def serve(cfg):
             elif self.path.startswith("/api/settings"):  # settable at runtime: IR mode, node count, rotation
                 body = self._body(); out = {}
                 if body:
-                    ir = body.get("restricted")
-                    if ir is not None:
-                        # Iran mode: ONE toggle fills both v2ray placeholders from user input once
-                        c["upstream_proxy"] = (body.get("upstream_proxy") or c.get("upstream_proxy") or "").strip() if ir else ""
-                        c["wg_endpoint_override"] = (body.get("wg_endpoint_override") or c.get("wg_endpoint_override") or "").strip() if ir else ""
-                        out["restricted"] = ir
+                    if body.get("usque_dns") is not None:
+                        c["usque_dns"] = body["usque_dns"].strip() or "1.1.1.1"
+                        out["usque_dns"] = c["usque_dns"]
                     if body.get("nodes"):
                         c["nodes"] = max(0, int(body["nodes"]))
                         stn = load_state()
@@ -577,10 +515,6 @@ def serve(cfg):
                     if body.get("rotate_interval_s"):
                         c["rotate_interval_s"] = max(30, int(body["rotate_interval_s"]))
                         out["rotate_interval_s"] = c["rotate_interval_s"]
-                    if body.get("upstream_proxy") is not None and ir is None:
-                        c["upstream_proxy"] = body["upstream_proxy"].strip(); out["upstream_proxy"] = c["upstream_proxy"]
-                    if body.get("wg_endpoint_override") is not None and ir is None:
-                        c["wg_endpoint_override"] = body["wg_endpoint_override"].strip(); out["wg_endpoint_override"] = c["wg_endpoint_override"]
                     save_cfg(c); LOGBOX["changed"] = LOGBOX.get("changed", []) + [f"settings updated {out}"]
                     if c["nine_router"].get("enabled"):
                         try: install_9r(c); LOGBOX["changed"].append("9router pools synced")
@@ -605,33 +539,22 @@ def serve(cfg):
 
 # ---------------------------------------------------------------- main
 def main():
-    if not selftest_x25519():
-        print("x25519 self-test FAILED"); return 2
     if len(sys.argv) < 2:
         print(__doc__); return 2
     cmd = sys.argv[1]
     cfg = load_cfg()
     if cmd == "setup":
-        print("UnlProxy setup — 3 answers, everything else is automatic\n")
-        where = (input("Where will this run? [server / windows-desktop / iran] (server): ") or "server").strip().lower()
+        print("UnlProxy setup — 2 answers, everything else is automatic\n")
+        # MASQUE over 443 needs no relay, so there is no "where does this run" question
         try: n = int(input("How many egress nodes? [3]: ") or "3")
         except ValueError: n = 3
         serve_q = (input("Start the control UI? [Y/n]: ") or "y").strip().lower() != "n"
         if not os.path.exists(CONFIG_PATH): save_cfg(cfg)
-        if where == "iran" and cfg.get("upstream_proxy") == "":
-            print("\nIran mode: v2ray must be running. Two values are needed:")
-            print("  1) socks inbound of v2ray   (HTTP/registration + API calls)")
-            print("  2) dokodemo-door relay port (the UDP WireGuard tunnel itself)")
-            p1 = input("socks inbound    e.g. 127.0.0.1:10808 : ").strip()
-            p2 = input("dokodemo-door    e.g. 127.0.0.1:10809 : ").strip()
-            cfg["upstream_proxy"] = "socks5://" + p1 if p1 and "://" not in p1 else p1
-            cfg["wg_endpoint_override"] = p2
-            save_cfg(cfg)
         cfg["nodes"] = max(1, n); save_cfg(cfg)
-        download_wireproxy(cfg)
+        download_usque(cfg)
         os.makedirs(os.path.join(HERE, "nodes"), exist_ok=True)
         r = ensure(cfg); log(json.dumps(r))
-        if r["alive"] == 0: print("no node came up; check upstream/endpoint values above"); return 1
+        if r["alive"] == 0: print("no node came up; check the logs in nodes/"); return 1
         print(f"\npool ready: {r['alive']} node(s) up, {r['distinct_ips']} distinct egress address(es)")
         print(f"UI:   http://{'127.0.0.1' if cfg['ui_bind']=='0.0.0.0' else cfg['ui_bind']}:{cfg['ui_port']}/")
         if cfg["nine_router"].get("enabled"):
@@ -643,20 +566,15 @@ def main():
         return 0
     if cmd == "init":
         if not os.path.exists(CONFIG_PATH): save_cfg(cfg)
-        download_wireproxy(cfg)
+        download_usque(cfg)
         os.makedirs(os.path.join(HERE, "nodes"), exist_ok=True)
-        log(f"config at {CONFIG_PATH}; wireproxy at {wbin(cfg)}")
+        log(f"config at {CONFIG_PATH}; usque at {ubin(cfg)}")
         r = ensure(cfg); log(json.dumps(r)); return 0
     if cmd == "up":
         cfg.setdefault("nodes", 3); st = load_state(); st.setdefault("nodes", {})
         for i in range(cfg["nodes"]):
             st["nodes"].setdefault(str(cfg["base_port"] + i), {"registered_at": 0, "drained": False})
         save_state(st); r = ensure(cfg); log(json.dumps(r)); return 0
-
-        if cfg["nine_router"].get("enabled"):
-            try: install_9r(cfg)
-            except Exception as e: log(f"9r install failed: {e}")
-        return 0
     if cmd == "down":
         for p in load_state().get("nodes", {}): stop_node(p)
         log("all stopped"); return 0
@@ -673,7 +591,7 @@ def main():
         for p in ports:
             stop_node(p, {"nodes": st}); r = register(cfg, int(p))
             if r:
-                st[p].update(r); spawn(cfg, int(p), {"nodes": st}); time.sleep(1.5)
+                st[p].update(r); spawn(cfg, int(p), {"nodes": st}); time.sleep(3)
                 got = measure(cfg, int(p)).get("ip") if sock_open(int(p)) else None
                 st[p]["measure"] = {"ip": got, "warp": True} if got else {}
                 st[p]["measured_at"] = time.time(); log(f"{p} rotated -> {got or '?'}")

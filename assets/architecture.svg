@@ -28,17 +28,17 @@
 
     <g>
       <rect x="640" y="80" width="220" height="72" rx="9" fill="#101724" stroke="#2a3350"/>
-      <text x="658" y="106" font-size="12" fill="#38d97a">● wireproxy :18090</text>
+      <text x="658" y="106" font-size="12" fill="#38d97a">● usque :18090</text>
       <text x="658" y="126" font-size="11" fill="#7d879b">socks5 · node-18090.conf</text>
       <text x="658" y="143" font-size="10" fill="#5d687e">own keypair · own registration</text>
 
       <rect x="640" y="170" width="220" height="72" rx="9" fill="#101724" stroke="#2a3350"/>
-      <text x="658" y="196" font-size="12" fill="#38d97a">● wireproxy :18091</text>
+      <text x="658" y="196" font-size="12" fill="#38d97a">● usque :18091</text>
       <text x="658" y="216" font-size="11" fill="#7d879b">socks5 · node-18091.conf</text>
       <text x="658" y="233" font-size="10" fill="#5d687e">own keypair · own registration</text>
 
       <rect x="640" y="260" width="220" height="72" rx="9" fill="#101724" stroke="#2a3350"/>
-      <text x="658" y="286" font-size="12" fill="#38d97a">● wireproxy :18092</text>
+      <text x="658" y="286" font-size="12" fill="#38d97a">● usque :18092</text>
       <text x="658" y="306" font-size="11" fill="#7d879b">socks5 · node-18092.conf</text>
       <text x="658" y="323" font-size="10" fill="#5d687e">own keypair · own registration</text>
     </g>
@@ -73,6 +73,6 @@
       <text x="40" y="542">drain          a node that cannot get a distinct address stays down until you rotate it by hand</text>
       <text x="40" y="566">publish        POST /api/proxy-pools then POST /api/proxy-pools/{id}/test (untested pools are reaped ~2 min)</text>
     </g>
-    <text x="40" y="600" font-size="10" fill="#4a5468">no root · no docker · no /dev/net/tun · wireproxy handles WireGuard in userspace</text>
+    <text x="40" y="600" font-size="10" fill="#4a5468">no root · no docker · no /dev/net/tun · usque carries WARP over MASQUE/TCP 443 in userspace</text>
   </g>
 </svg>

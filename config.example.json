@@ -3,9 +3,8 @@
   "base_port": 18090,
   "rotate_interval_s": 300,
   "measure_url": "https://www.cloudflare.com/cdn-cgi/trace",
-  "upstream_proxy": "",
-  "wg_endpoint_override": "",
-  "wireproxy_bin": "",
+  "usque_bin": "",
+  "usque_dns": "1.1.1.1",
   "ui_bind": "127.0.0.1",
   "ui_port": 8180,
   "nine_router": {
@@ -14,7 +13,6 @@
     "cli_token": "",
     "pool_prefix": "warp-"
   },
-  "cf_client_version": "a-6.81-2410032352.1",
   "reg_backoff_s": [
     60,
     120

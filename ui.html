@@ -127,10 +127,9 @@ dialog .dlgbar{display:flex;gap:8px;padding:6px 18px 14px}
   <label>nodes <input id=s-nodes type=number min=1 max=8></label>
   <label>rotate every <input id=s-rot type=number min=30 step=30> s</label>
   <label class=chk><input id=s-9r type=checkbox> push pools to 9router</label>
-  <h3>restricted network (iran)</h3>
-  <input id=s-px placeholder="socks inbound  e.g. 127.0.0.1:10808">
-  <input id=s-wg placeholder="dokodemo relay e.g. 127.0.0.1:10809">
-  <div class=hint>both empty = direct egress</div>
+  <h3>tunnel</h3>
+  <input id=s-dns placeholder="dns inside the tunnel  e.g. 1.1.1.1">
+  <div class=hint>MASQUE over TCP 443 (--http2). pinned DNS avoids the stalled default resolvers.</div>
 </div>
   <div class=dlgbar><button onclick=saveSet class=primary>save</button><button onclick="set.close()">close</button></div>
   <div id=s-msg class=hint></div>
@@ -191,9 +190,7 @@ async function openSet(){
  try{const c=await (await fetch('api/config')).json();
   $('s-nodes').value=c.nodes||3; $('s-rot').value=c.rotate_interval_s||300;
   $('s-9r').checked=!!(c.nine_router&&c.nine_router.enabled);
-  $('s-px').value=''; $('s-wg').value='';
-  $('s-px').placeholder=(c.upstream_proxy?'current: set (type new to change)':'socks inbound  e.g. 127.0.0.1:10808');
-  $('s-wg').placeholder=(c.wg_endpoint_override?'current: set (type new to change)':'dokodemo relay e.g. 127.0.0.1:10809');
+  $('s-dns').value=c.usque_dns||'1.1.1.1';
   $('s-msg').textContent='';
   set.showModal();
  }catch(e){$('s-msg').textContent='cannot read config';set.showModal()}
@@ -202,8 +199,7 @@ async function saveSet(){
  msg('saving…');
  const body={nodes:+$('s-nodes').value, rotate_interval_s:+$('s-rot').value,
    nine_router_enabled:$('s-9r').checked};
- const px=$('s-px').value.trim(), wg=$('s-wg').value.trim();
- if(px||wg){body.upstream_proxy=px; body.wg_endpoint_override=wg}
+ body.usque_dns=$('s-dns').value.trim()
  try{const r=await (await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
   msg('saved ✓'); setTimeout(()=>{set.close();load()},600);
   if(r.nodes!==undefined)pushLog([`nodes -> ${r.nodes}`]);
