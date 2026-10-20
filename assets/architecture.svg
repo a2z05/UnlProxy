@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="620" viewBox="0 0 1100 620" role="img" aria-label="UnlProxy architecture">
+  <defs>
+    <linearGradient id="b" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0c0f16"/><stop offset="1" stop-color="#0a0c11"/>
+    </linearGradient>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#ff6b57"/>
+    </marker>
+    <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#38d97a"/>
+    </marker>
+  </defs>
+  <rect width="1100" height="620" fill="url(#b)"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <text x="40" y="46" font-size="20" fill="#eef2f8">UnlProxy · <tspan fill="#ff6b57">architecture</tspan></text>
+    <text x="40" y="70" font-size="12" fill="#6f7b93">a fresh registration is a fresh quota bucket — the loop is: measure, dedupe, rotate</text>
+
+    <rect x="40" y="120" width="180" height="86" rx="9" fill="#101724" stroke="#2a3350"/>
+    <text x="58" y="148" font-size="13" fill="#dfe3ea">app / 9router</text>
+    <text x="58" y="170" font-size="11" fill="#7d879b">consumer</text>
+    <text x="58" y="188" font-size="11" fill="#7d879b">socks5 per node</text>
+
+    <rect x="300" y="110" width="240" height="106" rx="9" fill="#131b2b" stroke="#ff6b57" stroke-opacity="0.55"/>
+    <text x="318" y="138" font-size="13" fill="#ff8b7a">warppool.py</text>
+    <text x="318" y="159" font-size="11" fill="#9fb0d0">ensure → health · dedupe · rotate</text>
+    <text x="318" y="177" font-size="11" fill="#9fb0d0">install-9r → create + TEST pools</text>
+    <text x="318" y="195" font-size="11" fill="#6f7b93">cron: every 5 min</text>
+
+    <g>
+      <rect x="640" y="80" width="220" height="72" rx="9" fill="#101724" stroke="#2a3350"/>
+      <text x="658" y="106" font-size="12" fill="#38d97a">● wireproxy :18090</text>
+      <text x="658" y="126" font-size="11" fill="#7d879b">socks5 · node-18090.conf</text>
+      <text x="658" y="143" font-size="10" fill="#5d687e">own keypair · own registration</text>
+
+      <rect x="640" y="170" width="220" height="72" rx="9" fill="#101724" stroke="#2a3350"/>
+      <text x="658" y="196" font-size="12" fill="#38d97a">● wireproxy :18091</text>
+      <text x="658" y="216" font-size="11" fill="#7d879b">socks5 · node-18091.conf</text>
+      <text x="658" y="233" font-size="10" fill="#5d687e">own keypair · own registration</text>
+
+      <rect x="640" y="260" width="220" height="72" rx="9" fill="#101724" stroke="#2a3350"/>
+      <text x="658" y="286" font-size="12" fill="#38d97a">● wireproxy :18092</text>
+      <text x="658" y="306" font-size="11" fill="#7d879b">socks5 · node-18092.conf</text>
+      <text x="658" y="323" font-size="10" fill="#5d687e">own keypair · own registration</text>
+    </g>
+
+    <rect x="920" y="150" width="140" height="112" rx="9" fill="#131a12" stroke="#38d97a" stroke-opacity="0.4"/>
+    <text x="936" y="176" font-size="12" fill="#cfe8d8">Cloudflare</text>
+    <text x="936" y="195" font-size="11" fill="#7f9b88">WARP edge</text>
+    <text x="936" y="216" font-size="10" fill="#5e7a67">1 IP per node</text>
+    <text x="936" y="233" font-size="10" fill="#5e7a67">per-IP quota</text>
+    <text x="936" y="250" font-size="10" fill="#5e7a67">ban = rotate</text>
+
+    <g stroke="#ff6b57" stroke-width="1.6" fill="none" marker-end="url(#ar)" stroke-opacity="0.85">
+      <path d="M220 163 H 296"/>
+      <path d="M540 150 C 590 150, 600 116, 636 116"/>
+      <path d="M540 163 H 636"/>
+      <path d="M540 176 C 590 176, 600 296, 636 296"/>
+    </g>
+    <g stroke="#38d97a" stroke-width="1.6" fill="none" marker-end="url(#ar2)" stroke-opacity="0.75">
+      <path d="M860 116 C 890 116, 900 190, 918 190"/>
+      <path d="M860 206 H 918"/>
+      <path d="M860 296 C 890 296, 900 224, 918 224"/>
+    </g>
+
+    <path d="M920 210 C 820 400, 400 400, 360 220" stroke="#ffb020" stroke-width="1.4" fill="none"
+          stroke-dasharray="5 5" marker-end="url(#ar)" stroke-opacity="0.8"/>
+    <text x="470" y="392" font-size="11" fill="#ffb020">429 / 403-abusive → re-register → new address</text>
+
+    <g font-size="11" fill="#7d879b">
+      <text x="40" y="470">registration   POST api.cloudflareclient.com/v0a2483/reg  →  keypair + peer + addresses</text>
+      <text x="40" y="494">measure        curl --socks5-hostname 127.0.0.1:&lt;port&gt; cloudflare.com/cdn-cgi/trace → ip, warp, colo</text>
+      <text x="40" y="518">dedupe         two nodes on one address = one burn costs two slots  →  re-register the newer one</text>
+      <text x="40" y="542">drain          a node that cannot get a distinct address stays down until you rotate it by hand</text>
+      <text x="40" y="566">publish        POST /api/proxy-pools then POST /api/proxy-pools/{id}/test (untested pools are reaped ~2 min)</text>
+    </g>
+    <text x="40" y="600" font-size="10" fill="#4a5468">no root · no docker · no /dev/net/tun · wireproxy handles WireGuard in userspace</text>
+  </g>
+</svg>

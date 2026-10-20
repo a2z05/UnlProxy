@@ -1,0 +1,7 @@
+# never commit: secrets, live state, node private keys, binaries, logs
+config.json
+state.json
+nodes/
+bin/
+*.log
+__pycache__/

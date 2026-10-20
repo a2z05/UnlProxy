@@ -1,0 +1,214 @@
+<!doctype html><meta charset=utf-8><title>UnlProxy — egress control</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+:root{
+  --bg:#0b0d12; --panel:#12172200; --card:#121826; --card2:#0e131d;
+  --ink:#e8ecf4; --dim:#8a93a8; --faint:#5d687e;
+  --edge:#232b3d; --edge2:#2c3752;
+  --red:#ff5c47; --red-d:#7c1410; --green:#3ad47f; --amber:#ffb020; --cyan:#4fc3f7;
+  --mono:"JetBrains Mono",ui-monospace,"Cascadia Code",Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 var(--mono);-webkit-font-smoothing:antialiased}
+/* backdrop: grid + vignette + scanlines (subtle, 4% opacity) */
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:
+   radial-gradient(1100px 500px at 18% -8%, rgba(224,46,46,.10), transparent 60%),
+   repeating-linear-gradient(0deg,transparent 0 2px,rgba(255,255,255,.022) 2px 3px),
+   linear-gradient(transparent,rgba(0,0,0,.35));
+}
+body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:1;
+  background:
+   repeating-linear-gradient(90deg,transparent 0 38px,rgba(140,160,220,.04) 38px 39px),
+   repeating-linear-gradient(0deg,transparent 0 38px,rgba(140,160,220,.04) 38px 39px);
+  mask-image:radial-gradient(75% 65% at 50% 30%, #000 30%, transparent 100%);
+}
+.wrap{position:relative;z-index:2;max-width:1060px;margin:0 auto;padding:30px 22px 60px}
+
+/* header */
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.logo{width:34px;height:34px;flex:0 0 auto}
+h1{font-size:19px;margin:0;letter-spacing:.4px;font-weight:600}
+h1 em{color:var(--red);font-style:normal}
+.tag{color:var(--dim);font-size:12px;letter-spacing:.14em;text-transform:uppercase}
+.live{margin-left:auto;display:flex;align-items:center;gap:7px;color:var(--dim);font-size:12px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);animation:pulse 2.4s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+/* stat strip */
+.stats{display:flex;gap:10px;margin:22px 0 6px;flex-wrap:wrap}
+.stat{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--edge);border-radius:10px;padding:12px 16px;min-width:120px;transition:border-color .2s,transform .2s}
+.stat:hover{border-color:var(--edge2);transform:translateY(-1px)}
+.stat b{display:block;font-size:24px;font-weight:600;letter-spacing:-.02em}
+.stat span{color:var(--faint);font-size:11px;letter-spacing:.12em;text-transform:uppercase}
+.stat.ok b{color:var(--green)} .stat.warn b{color:var(--amber)} .stat.bad b{color:var(--red)}
+
+/* action bar */
+.bar{display:flex;gap:10px;margin:18px 0 26px;flex-wrap:wrap}
+button{font:inherit;background:#171e2e;color:var(--ink);border:1px solid var(--edge2);border-radius:8px;padding:9px 18px;cursor:pointer;position:relative;overflow:hidden;transition:border-color .18s,background .18s,transform .06s;user-select:none}
+button::before{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent 30%,rgba(255,91,71,.14) 50%,transparent 70%);transform:translateX(-110%);transition:transform .5s}
+button:hover{border-color:var(--red);background:#1c2438}
+button:hover::before{transform:translateX(110%)}
+button:active{transform:scale(.97)}
+button:disabled{opacity:.45;cursor:default}
+button.primary{background:var(--red-d);border-color:#a42219}
+button.primary:hover{background:#931c13}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;vertical-align:-2px;margin-right:7px;animation:rot .7s linear infinite}
+@keyframes rot{to{transform:rotate(360deg)}}
+
+/* card grid */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.node{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--edge);border-radius:12px;padding:16px 18px;position:relative;overflow:hidden;transition:border-color .25s,transform .25s,opacity .25s;opacity:0;animation:enter .5s forwards}
+.node:hover{border-color:var(--edge2);transform:translateY(-2px)}
+.node::after{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:var(--red);opacity:0;transition:opacity .3s}
+.node.up::after{background:var(--green);opacity:.6}
+.node.down::after{background:var(--red);opacity:.7}
+.node.drained::after{background:var(--amber);opacity:.7}
+@keyframes enter{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.top{display:flex;align-items:baseline;gap:10px}
+.port{font-size:17px;font-weight:600}
+.state{margin-left:auto;font-size:11px;letter-spacing:.14em;text-transform:uppercase;padding:3px 9px;border-radius:20px;border:1px solid var(--edge2)}
+.state.up{color:var(--green);border-color:rgba(58,212,127,.4)}
+.state.down{color:var(--red);border-color:rgba(255,92,71,.4)}
+.state.drained{color:var(--amber);border-color:rgba(255,176,32,.4)}
+.ip{font-size:13px;color:var(--dim);margin:8px 0 2px;word-break:break-all;transition:color .3s}
+.ip.flash{color:var(--cyan);animation:flash 1.2s}
+@keyframes flash{0%{color:var(--cyan);text-shadow:0 0 8px rgba(79,195,247,.5)}100%{color:var(--dim);text-shadow:none}}
+.meta{display:flex;gap:16px;color:var(--faint);font-size:11px;margin-top:10px;flex-wrap:wrap}
+.meta b{color:var(--dim);font-weight:500}
+.agebar{margin-top:12px;height:3px;background:#1a2132;border-radius:2px;overflow:hidden}
+.agebar i{display:block;height:100%;background:var(--red);transition:width .6s cubic-bezier(.2,.7,.3,1)}
+.node.up .agebar i{background:linear-gradient(90deg,var(--green),#8fe3b3)}
+.node .row{display:flex;gap:8px;margin-top:14px}
+.node .row button{padding:6px 12px;font-size:12px;border-radius:6px}
+
+/* log console */
+.console{margin-top:28px;background:#0a0e16;border:1px solid var(--edge);border-radius:12px;overflow:hidden}
+.console header{padding:10px 16px;border-bottom:1px solid #1a2233;display:flex;gap:10px;align-items:center;background:#0d1220}
+.console header .tag{font-size:11px}
+.console pre{margin:0;padding:14px 16px;font-size:12px;line-height:1.7;max-height:260px;overflow:auto;color:#9fb0d0}
+.line{opacity:0;animation:enter .35s forwards}
+.line.flat-enter{animation:enter .35s forwards}
+.t{color:#4a5468;margin-right:10px}
+.line.warn .t,.line.warn{color:var(--amber)} .line.err{color:var(--red)} .line.ok{color:var(--green)}
+::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:#232b3d;border-radius:4px}
+dialog{background:var(--card);color:var(--ink);border:1px solid var(--edge2);border-radius:14px;padding:0;width:min(94vw,430px);animation:enter .25s}
+dialog::backdrop{background:rgba(5,7,12,.7);backdrop-filter:blur(3px)}
+dialog h2{margin:14px 18px 10px;font-size:15px;color:var(--red)}
+dialog h3{margin:14px 18px 6px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint)}
+dialog .bd{padding:0 18px 16px}
+dialog label{display:block;font-size:12px;color:var(--dim);margin:10px 0 4px}
+dialog label.chk{display:flex;align-items:center;gap:8px;cursor:pointer}
+dialog label.chk input{width:auto}
+dialog input,dialog input[type=number]{width:100%;background:#0d1220;color:var(--ink);border:1px solid var(--edge2);border-radius:7px;padding:8px 10px;font:inherit;font-size:13px;margin-top:2px}
+dialog input[type=checkbox]{width:16px;height:16px;accent-color:var(--red)}
+dialog input:focus{outline:none;border-color:var(--red)}
+dialog .hint{font-size:11px;color:var(--faint);margin:4px 18px 8px}
+dialog .dlgbar{display:flex;gap:8px;padding:6px 18px 14px}
+@keyframes shake{0%,100%{transform:none}25%{transform:translateX(-4px)}75%{transform:translateX(4px)}}
+.shake{animation:shake .3s}
+@media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition:none!important}}
+</style>
+<header class=wrap>
+ <svg class=logo viewBox="0 0 34 34"><rect width=34 height=34 rx=8 fill=%237c1410/><path d="M9 24 L17 8 L25 24 M12.5 18 L21.5 18" stroke=%23ff5c47 stroke-width=2.4 fill=none stroke-linecap=round/></svg>
+ <div><h1>Unl<em>Proxy</em></h1><div class=tag>egress control</div></div>
+ <div class=live><i class=dot></i><span id=livedrift>watching</span></div>
+</header>
+<main class=wrap>
+ <div class=stats id=stats></div>
+ <div class=bar>
+  <button class=primary id=b-ensure onclick=act('ensure')>run ensure</button>
+  <button id=b-rotate onclick=act('rotate?port=all')>rotate all</button>
+  <button id=b-revive onclick=act('revive') style="display:none">revive drained</button>
+  <button id=b-settings onclick=openSet style="margin-left:auto">manage</button>
+ </div>
+ <dialog id=set>
+  <h2>manage</h2><div class=bd>
+  <label>nodes <input id=s-nodes type=number min=1 max=8></label>
+  <label>rotate every <input id=s-rot type=number min=30 step=30> s</label>
+  <label class=chk><input id=s-9r type=checkbox> push pools to 9router</label>
+  <h3>restricted network (iran)</h3>
+  <input id=s-px placeholder="socks inbound  e.g. 127.0.0.1:10808">
+  <input id=s-wg placeholder="dokodemo relay e.g. 127.0.0.1:10809">
+  <div class=hint>both empty = direct egress</div>
+</div>
+  <div class=dlgbar><button onclick=saveSet class=primary>save</button><button onclick="set.close()">close</button></div>
+  <div id=s-msg class=hint></div>
+ </dialog>
+ <div class=grid id=nodes></div>
+ <section class=console>
+  <header><span class=tag>event log</span><span class=tag style="margin-left:auto" id=stamp></span></header>
+  <pre id=log></pre>
+ </section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let lastIps={};
+async function load(){
+ const r=await (await fetch('api/status')).json();
+ const up=r.filter(n=>n.state==='up'), drained=r.filter(n=>n.state==='drained').length;
+ const ips=new Set(r.filter(n=>n.state==='up'&&n.ip).map(n=>n.ip));
+ const avg=Math.round(r.reduce((a,n)=>a+(n.age_min||0),0)/(r.length||1));
+ const alive=up.length===r.length&&r.length>0;
+ $('stats').innerHTML=[
+  ['nodes',`${up.length}<span style="font-size:14px;color:var(--faint)">/${r.length}</span>`,alive?'ok':(up.length?'warn':'bad')],
+  ['distinct ips',ips.size,ips.size>=up.length?'ok':'warn'],
+  ['drained',drained,drained?'warn':'ok'],
+  ['avg age',avg+'m',avg>10?'warn':'ok']
+ ].map(([k,v,c])=>`<div class="stat ${c}"><b>${v}</b><span>${k}</span></div>`).join('');
+ const rv=document.getElementById('b-revive'); if(rv) rv.style.display=drained?'':'none';
+ $('nodes').innerHTML=r.map((n,i)=>{
+  const flash=n.ip&&lastIps[n.port]&&lastIps[n.port]!==n.ip?'flash':'';
+  lastIps[n.port]=n.ip;
+  const pct=Math.min(100,(n.age_min/30)*70);
+  return `<div class="node ${n.state}" style="animation-delay:${i*70}ms">
+   <div class=top><span class=port>node :${n.port}</span><span class="state ${n.state}">${n.state}</span></div>
+   <div class="ip ${flash}">${n.ip||'—'}</div>
+   <div class=meta><span>warp <b>${n.warp?'on':'—'}</b></span><span>age <b>${n.age_min}m</b></span>${n.pid?`<span>pid <b>${n.pid}</b></span>`:''}</div>
+   <div class=agebar><i style="width:${pct}%"></i></div>
+   <div class=row><button onclick=act('rotate?port=${n.port}')>rotate</button></div>
+  </div>`}).join('');
+ const l=await (await fetch('api/log')).json();
+ $('stamp').textContent=l.changed.length?l.changed.length+' events':'empty';
+ $('log').innerHTML=l.changed.slice(-30).reverse().map(line=>{ 
+  const m=line.match(/^\\[(\\d\\d:\\d\\d:\\d\\d)\\]\\s+(.*)$/);
+  const cls=/DRAINED|FAILED|did not/.test(line)?'err':/dedupe|rotated|re-registered|started|registered/.test(line)?'':/alive|drained/.test(line)?'warn':'';
+  return `<div class="line ${cls}">${m?`<span class=t>${m[1]}</span>${m[2]}`:line}</div>`}).join('')||'<div class="line"><span class=t>—</span>no events yet</div>';
+}
+async function act(q){
+ const b=q.includes('all')||q==='ensure'?$(q==='ensure'?'b-ensure':'b-rotate'):null;
+ if(b){b.disabled=true;b.innerHTML='<i class=spin></i>working';}
+ try{const r=await (await fetch('api/'+q,{method:'POST'})).json();
+  if(r.changed&&q.startsWith('rotate'))pushLog(r.changed);
+ } finally{ if(b){b.disabled=false;b.textContent=q==='ensure'?'run ensure':'rotate all';} }
+ load();
+}
+function pushLog(ch){const p=$('log');
+ ch.forEach(x=>p.insertAdjacentHTML('afterbegin',`<div class="line ok"><span class=t>${new Date().toLocaleTimeString().slice(0,8)}</span>${x}</div>`))}
+const set=document.getElementById('set');
+let have9r=false;
+async function openSet(){
+ try{const c=await (await fetch('api/config')).json();
+  $('s-nodes').value=c.nodes||3; $('s-rot').value=c.rotate_interval_s||300;
+  $('s-9r').checked=!!(c.nine_router&&c.nine_router.enabled);
+  $('s-px').value=''; $('s-wg').value='';
+  $('s-px').placeholder=(c.upstream_proxy?'current: set (type new to change)':'socks inbound  e.g. 127.0.0.1:10808');
+  $('s-wg').placeholder=(c.wg_endpoint_override?'current: set (type new to change)':'dokodemo relay e.g. 127.0.0.1:10809');
+  $('s-msg').textContent='';
+  set.showModal();
+ }catch(e){$('s-msg').textContent='cannot read config';set.showModal()}
+}
+async function saveSet(){
+ msg('saving…');
+ const body={nodes:+$('s-nodes').value, rotate_interval_s:+$('s-rot').value,
+   nine_router_enabled:$('s-9r').checked};
+ const px=$('s-px').value.trim(), wg=$('s-wg').value.trim();
+ if(px||wg){body.upstream_proxy=px; body.wg_endpoint_override=wg}
+ try{const r=await (await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  msg('saved ✓'); setTimeout(()=>{set.close();load()},600);
+  if(r.nodes!==undefined)pushLog([`nodes -> ${r.nodes}`]);
+ }catch(e){msg('save failed: '+e);$('set').classList.add('shake');setTimeout(()=>$('set').classList.remove('shake'),400)}
+}
+function msg(t){$('s-msg').textContent=t}
+load();setInterval(load,12000);
+</script>
