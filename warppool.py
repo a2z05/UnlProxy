@@ -895,12 +895,16 @@ def main():
             print()
             return 0
     if cmd == "daemon":
-        # pool only, no UI: bring everything up and keep it rotating
+        # the background service: pool + rotation, and the control UI too, so
+        # the panel is always there after an install
         r = ensure(cfg)
         log(json.dumps(r))
         if r["alive"] == 0:
             print("no node came up - see nodes/*.log"); return 1
         print(f"pool up: {r['alive']} node(s), {r['distinct_ips']} distinct egress address(es)")
+        if not _port_busy(cfg["ui_port"]):
+            threading.Thread(target=serve, args=(cfg,), daemon=True, name="ui").start()
+            print(f"UI: {_ui_url(cfg)}")
         print("rotation runs on its own here - Ctrl+C to stop the loop (the nodes stay up)")
         tick_loop()
         return 0
@@ -914,6 +918,9 @@ def main():
         if r["alive"] == 0:
             print("no node came up - see nodes/*.log"); return 1
         print(f"pool ready: {r['alive']} node(s), {r['distinct_ips']} distinct egress address(es)")
+        if not _port_busy(cfg["ui_port"]):
+            threading.Thread(target=serve, args=(cfg,), daemon=True, name="ui").start()
+            print(f"UI: {_ui_url(cfg)}")
         print("rotation runs on its own - Ctrl+C to stop (the nodes stay up)")
         tick_loop()
         return 0
