@@ -550,18 +550,13 @@ def tick_loop(interval=15):
     so without this the pool never rotates. 15s between cycles because one due
     node's rotation (reconnect, or register+spawn+measure+retries) takes 5-40s."""
     time.sleep(2)   # let the first window load before the first cycle
-    standing = False
     while True:
+        # The lock is taken and dropped inside one cycle, so two processes take
+        # turns. That is fine and silent; only a rotation is worth a log line.
         lock = None
         try:
             lock = _tick_holder()
-            if lock is None:
-                if not standing:
-                    log("tick: another process is already ticking - standing down")
-                    standing = True
-            else:
-                if standing:
-                    log("tick: rotation is ours again"); standing = False
+            if lock is not None:
                 r = ensure(load_cfg())
                 if r.get("changed"): log(f"tick: {', '.join(r['changed'])}")
         except Exception as e:
