@@ -521,8 +521,9 @@ def install_9r(cfg):
                 http_json(cfg, f"{base}/api/proxy-pools/{pid}/test", {}, headers=hdr, timeout=30)
             created.append(url)
         else: log(f"9r create {url}: HTTP {st2}")
-    log(f"9router: {len(created)} created" + (f": {created}" if created else "") +
-        (f", {len(retested)} retested" if retested else ""))
+    if created or retested:   # a quiet "0 created" every tick drowns the event log
+        log(f"9router: {len(created)} created" + (f": {created}" if created else "") +
+            (f", {len(retested)} retested" if retested else ""))
     return created
 
 # ---------------------------------------------------------------- UI
