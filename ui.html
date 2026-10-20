@@ -92,7 +92,11 @@ button.primary:hover{background:#931c13}
 .t{color:#4a5468;margin-right:10px}
 .line.warn .t,.line.warn{color:var(--amber)} .line.err{color:var(--red)} .line.ok{color:var(--green)}
 ::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:#232b3d;border-radius:4px}
-dialog{background:var(--card);color:var(--ink);border:1px solid var(--edge2);border-radius:14px;padding:0;width:min(94vw,430px);animation:enter .25s}
+/* no opacity animation on the dialog itself: <dialog> paints in the top layer,
+   and `animation:enter` (from{opacity:0}) without `forwards` left it faded out */
+dialog{background:var(--card);color:var(--ink);border:1px solid var(--edge2);border-radius:14px;padding:0;width:min(94vw,430px);animation:none}
+dialog[open],dialog.open{display:block;opacity:1;position:fixed;inset:0;margin:auto;max-height:90vh;overflow:auto;z-index:9}
+.setfade{background:rgba(5,7,12,.55)}
 dialog::backdrop{background:rgba(5,7,12,.7);backdrop-filter:blur(3px)}
 dialog h2{margin:14px 18px 10px;font-size:15px;color:var(--red)}
 dialog h3{margin:14px 18px 6px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint)}
@@ -100,8 +104,11 @@ dialog .bd{padding:0 18px 16px}
 dialog label{display:block;font-size:12px;color:var(--dim);margin:10px 0 4px}
 dialog label.chk{display:flex;align-items:center;gap:8px;cursor:pointer}
 dialog label.chk input{width:auto}
-dialog input,dialog input[type=number]{width:100%;background:#0d1220;color:var(--ink);border:1px solid var(--edge2);border-radius:7px;padding:8px 10px;font:inherit;font-size:13px;margin-top:2px}
+dialog input,dialog input[type=number],dialog select{width:100%;background:#0d1220;color:var(--ink);border:1px solid var(--edge2);border-radius:7px;padding:8px 10px;font:inherit;font-size:13px;margin-top:2px}
 dialog input[type=checkbox]{width:16px;height:16px;accent-color:var(--red)}
+dialog select{cursor:pointer}
+dialog code{color:var(--cyan);font-size:11px}
+dialog h3:first-of-type{margin-top:8px}
 dialog input:focus{outline:none;border-color:var(--red)}
 dialog .hint{font-size:11px;color:var(--faint);margin:4px 18px 8px}
 dialog .dlgbar{display:flex;gap:8px;padding:6px 18px 14px}
@@ -120,18 +127,40 @@ dialog .dlgbar{display:flex;gap:8px;padding:6px 18px 14px}
   <button class=primary id=b-ensure onclick=act('ensure')>run ensure</button>
   <button id=b-rotate onclick=act('rotate?port=all')>rotate all</button>
   <button id=b-revive onclick=act('revive') style="display:none">revive drained</button>
-  <button id=b-settings onclick=openSet style="margin-left:auto">manage</button>
+  <button id=b-settings onclick="openSet()" style="margin-left:auto">manage</button>
  </div>
  <dialog id=set>
   <h2>manage</h2><div class=bd>
-  <label>nodes <input id=s-nodes type=number min=1 max=8></label>
-  <label>rotate every <input id=s-rot type=number min=30 step=30> s</label>
-  <label class=chk><input id=s-9r type=checkbox> push pools to 9router</label>
+  <h3>pool</h3>
+  <label>nodes <input id=s-nodes type=number min=1 max=16></label>
+  <label>rotate every <input id=s-rot type=number min=10 step=10> s</label>
+  <div class=hint>a reconnect alone usually changes the egress; a full re-register only runs if it does not</div>
+  <label>base socks port <input id=s-base type=number min=1024 max=65000></label>
+
   <h3>tunnel</h3>
   <input id=s-dns placeholder="dns inside the tunnel  e.g. 1.1.1.1">
   <div class=hint>MASQUE over TCP 443 (--http2). pinned DNS avoids the stalled default resolvers.</div>
+  <label>measure url <input id=s-measure placeholder="https://www.cloudflare.com/cdn-cgi/trace"></label>
+  <div class=hint>any text endpoint that echoes <code>ip=</code> and <code>warp=</code> works</div>
+
+  <h3>webhook</h3>
+  <label class=chk><input id=s-wh type=checkbox> notify a webhook on trouble</label>
+  <input id=s-whurl placeholder="https://discord.com/api/webhooks/…  or any JSON POST">
+  <label>only send <select id=s-whlvl><option value=warn>warnings and errors</option><option value=error>errors only</option></select></label>
+  <div class=hint>posts {"content": …} so Discord and Slack both accept it. Tests with the button below.</div>
+  <div class=dlgbar style="padding:8px 0 0"><button onclick="testHook()">send test</button></div>
+
+  <h3>9router</h3>
+  <label class=chk><input id=s-9r type=checkbox> push pools to 9router</label>
+  <label>base url <input id=s-9rurl placeholder="http://127.0.0.1:20128"></label>
+  <label>pool prefix <input id=s-9rpre placeholder="warp-"></label>
+
+  <h3>ui</h3>
+  <label>bind <input id=s-bind placeholder="127.0.0.1  (use 0.0.0.0 for LAN)"></label>
+  <label>port <input id=s-port type=number min=1024 max=65000></label>
+  <div class=hint>changing the UI port or bind takes effect on the next start.</div>
 </div>
-  <div class=dlgbar><button onclick=saveSet class=primary>save</button><button onclick="set.close()">close</button></div>
+  <div class=dlgbar><button onclick="saveSet()" class=primary>save</button><button onclick="closeSet()">close</button></div>
   <div id=s-msg class=hint></div>
  </dialog>
  <div class=grid id=nodes></div>
@@ -187,21 +216,50 @@ function pushLog(ch){const p=$('log');
 const set=document.getElementById('set');
 let have9r=false;
 async function openSet(){
+ // open first, fill after: a slow or failed config read must never swallow the
+ // click (the old code opened only after `await fetch`, inside a try that
+ // silently returned when the fetch rejected)
+ showSet();
  try{const c=await (await fetch('api/config')).json();
   $('s-nodes').value=c.nodes||3; $('s-rot').value=c.rotate_interval_s||300;
-  $('s-9r').checked=!!(c.nine_router&&c.nine_router.enabled);
+  $('s-base').value=c.base_port||18090;
   $('s-dns').value=c.usque_dns||'1.1.1.1';
+  $('s-measure').value=c.measure_url||'';
+  const w=c.webhook||{};
+  $('s-wh').checked=!!w.enabled; $('s-whurl').value=w.url||''; $('s-whlvl').value=w.min_level||'warn';
+  const n=c.nine_router||{};
+  $('s-9r').checked=!!n.enabled; $('s-9rurl').value=n.base_url||''; $('s-9rpre').value=n.pool_prefix||'warp-';
+  $('s-bind').value=c.ui_bind||'127.0.0.1'; $('s-port').value=c.ui_port||8180;
   $('s-msg').textContent='';
-  set.showModal();
- }catch(e){$('s-msg').textContent='cannot read config';set.showModal()}
+ }catch(e){$('s-msg').textContent='cannot read config'}
+}
+async function testHook(){
+ msg('sending…');
+ try{const r=await (await fetch('api/webhook-test',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({url:$('s-whurl').value.trim()})})).json();
+  msg(r.ok?'test delivered ✓':('failed: '+(r.error||'see the event log')));
+ }catch(e){msg('failed: '+e)}
+}
+function showSet(){
+ try{ if(!set.open) set.showModal(); else set.close(); }
+ catch(e){ set.classList.toggle('open'); set.setAttribute('open',''); }
+}
+function closeSet(){
+ try{ set.close(); }catch(e){ set.classList.remove('open'); set.removeAttribute('open'); }
 }
 async function saveSet(){
  msg('saving…');
  const body={nodes:+$('s-nodes').value, rotate_interval_s:+$('s-rot').value,
-   nine_router_enabled:$('s-9r').checked};
- body.usque_dns=$('s-dns').value.trim()
+   base_port:+$('s-base').value,
+   usque_dns:$('s-dns').value.trim(), measure_url:$('s-measure').value.trim(),
+   webhook_enabled:$('s-wh').checked, webhook_url:$('s-whurl').value.trim(),
+   webhook_level:$('s-whlvl').value,
+   nine_router_enabled:$('s-9r').checked, nine_router_url:$('s-9rurl').value.trim(),
+   nine_router_prefix:$('s-9rpre').value.trim(),
+   ui_bind:$('s-bind').value.trim(), ui_port:+$('s-port').value};
  try{const r=await (await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
-  msg('saved ✓'); setTimeout(()=>{set.close();load()},600);
+  if(r.error){msg('save failed: '+r.error);return}
+  msg('saved ✓'); setTimeout(()=>{closeSet();load()},600);
   if(r.nodes!==undefined)pushLog([`nodes -> ${r.nodes}`]);
  }catch(e){msg('save failed: '+e);$('set').classList.add('shake');setTimeout(()=>$('set').classList.remove('shake'),400)}
 }

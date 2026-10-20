@@ -1,0 +1,12 @@
+#!/bin/sh
+# UnlProxy launcher.
+#   unlp            open the control UI in the browser
+#   unlp cli        interactive console
+#   unlp status     node table
+#   unlp rotate     rotate now
+DIR="${UNLPROXY_DIR:-$HOME/.unlproxy}"
+PY=$(command -v python3 2>/dev/null || command -v python 2>/dev/null)
+[ -n "$PY" ] || { echo "python3 not found" >&2; exit 1; }
+[ -f "$DIR/warppool.py" ] || { echo "UnlProxy is not installed at $DIR" >&2; exit 1; }
+[ $# -eq 0 ] && set -- ui
+exec "$PY" "$DIR/warppool.py" "$@"

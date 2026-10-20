@@ -1,0 +1,6 @@
+# shell scripts and launchers must keep LF: CRLF makes `sh` fail with `\r: not found`
+*.sh   text eol=lf
+unlp   text eol=lf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf

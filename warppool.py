@@ -4,35 +4,44 @@
 Built on the mechanics of ebouther/opencode-unlimited-proxy (MIT), re-implemented
 portable and dependency-free:
 
-  * every node = its own WARP registration = its own egress address
-  * rotation = re-register (fresh device) on an interval or on demand
-  * dedupe = measure each node's REAL egress; colliding nodes are re-registered,
-    nodes that cannot be given a distinct address are drained (stopped)
-  * health = a dead node is restarted; a drained node stays down until revived
+* every node = its own WARP registration = its own egress address
+* rotation = reconnect the tunnel first (cheap, ~5s, usually a new address);
+  re-register (fresh device, 20-40s) only when the address did not change
+* dedupe = measure each node's REAL egress; colliding nodes are re-registered,
+  nodes that cannot be given a distinct address are drained (stopped)
+* health = a dead node is restarted; a drained node stays down until revived
 
 The tunnel is Cloudflare WARP over MASQUE (usque, HTTP/2 over TCP 443), not
 WireGuard-over-UDP 2408: UDP to Cloudflare is blackholed on Iranian ISPs, so a
 WireGuard handshake never comes back — TCP/443 does. Per-node distinct egress
 comes from one usque registration each.
 
+Rotation is self-driving: `daemon`, `install` and `serve` all run a background
+tick that calls ensure() every 15s, so no cron entry is needed.
+
 Runs on Linux and Windows with stdlib only (usque does the tunnel in userspace,
 SOCKS5 mode — no admin, no TUN, no Docker).
 
 Commands:
-  warppool.py init            write config.json + download usque if missing
-  warppool.py up              start every non-drained node
-  warppool.py down            stop every node
-  warppool.py ensure          health + dedupe + rotate-due  (cron entrypoint)
-  warppool.py status          print table + JSON summary
-  warppool.py rotate [p|all]  force fresh registration
-  warppool.py serve           UI on ui_port (default 127.0.0.1:8180)
-  warppool.py install-9r      push nodes into 9router's proxy pools (CLI token)
+warppool.py setup           2 answers, config + usque + nodes + (optional) UI
+warppool.py cli             interactive console (status/rotate/nodes/9r), no browser
+warppool.py init            write config.json + download usque if missing
+warppool.py install         one command: config + usque + nodes up + rotating daemon
+warppool.py daemon          pool only, rotating daemon (no UI)
+warppool.py config          tune headless: --nodes --dns --rotate --9r/--no-9r
+warppool.py up / down       start / stop every node
+warppool.py ensure          health + dedupe + rotate-due (one cycle, cron entrypoint)
+warppool.py status          print table + JSON summary
+warppool.py rotate [p|all]  force a rotation now (reconnect, else re-register)
+warppool.py serve           UI on ui_port (default 127.0.0.1:8180) + rotating tick
+warppool.py install-9r      push nodes into 9router's proxy pools (CLI token)
 """
-import json, os, re, signal, socket, ssl, subprocess, sys, time, urllib.request, urllib.error, hashlib, base64, random, string
+import json, os, re, signal, socket, ssl, subprocess, sys, time, urllib.request, urllib.error, hashlib, base64, random, string, threading, webbrowser
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("WARPPOOL_CONFIG", os.path.join(HERE, "config.json"))
 STATE_PATH = os.path.join(HERE, "state.json")
+LOG_PATH = os.path.join(HERE, "events.log")
 WIN = os.name == "nt"
 
 DEFAULTS = {
@@ -47,9 +56,15 @@ DEFAULTS = {
     "nine_router": {"enabled": False, "base_url": "http://127.0.0.1:20128",
                     "cli_token": "", "pool_prefix": "warp-"},
     "reg_backoff_s": [60, 120],   # CF 429/403: long backoff (their own lesson)
+    "webhook": {"enabled": False, "url": "", "min_level": "warn"},  # warn | error
+    "notify_timeout_s": 10,
 }
 
 STALE_MEASURE_S = 150
+
+# one writer at a time: the tick thread, the UI buttons and the CLI all touch
+# state.json, and interleaving them corrupts node state (pid/registered_at)
+STATE_LOCK = threading.RLock()
 
 
 def load_cfg():
@@ -64,6 +79,11 @@ def save_cfg(cfg):
 def load_state():
     try: return json.load(open(STATE_PATH))
     except Exception: return {"nodes": {}}
+
+def _events():
+    try:
+        with open(LOG_PATH, encoding="utf-8") as f: return [l for l in f.read().splitlines() if l.strip()][-400:]
+    except OSError: return []
 
 def save_state(st):
     json.dump(st, open(STATE_PATH, "w"), indent=1)
@@ -86,8 +106,41 @@ def fetch_text(cfg, url, timeout=20):
     with op.open(url, timeout=to) as r:
         return r.read().decode(errors="replace")
 
+_LEVELS = {"info": 0, "warn": 1, "error": 2}
+_notify_last = {}
+
+def notify(cfg, text, level="warn", dedupe_s=300):
+    """Fire the configured webhook. Never raises: a broken hook must not stop a
+    rotation. Repeats of the same text are throttled — an alert that fires every
+    15s tick gets muted by whoever is reading it."""
+    wh = (cfg or {}).get("webhook") or {}
+    url = (wh.get("url") or "").strip()
+    if not url or not wh.get("enabled"): return False
+    if _LEVELS.get(level, 1) < _LEVELS.get(wh.get("min_level") or "warn", 1): return False
+    key = text[:200]
+    now = time.time()
+    if now - _notify_last.get(key, 0) < dedupe_s: return False
+    _notify_last[key] = now
+    payload = {"text": text, "content": text, "level": level,   # text/content: Slack & Discord both
+               "source": "unlproxy", "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+               "host": socket.gethostname()}
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.build_opener().open(req, timeout=int(cfg.get("notify_timeout_s") or 10)) as r:
+            log(f"webhook {level}: HTTP {r.status}")
+        return True
+    except Exception as e:
+        log(f"webhook {level} failed: {e}")
+        return False
+
 def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f: f.write(line + chr(10))
+    except OSError:
+        pass
 
 # ---------------------------------------------------------------- usque (WARP over MASQUE)
 # WireGuard on UDP 2408 is blackholed on Iranian ISPs (handshake never returns);
@@ -120,8 +173,7 @@ def conf_path(cfg, port):
     return os.path.join(HERE, "nodes", f"node-{port}", "config.json")
 
 def register(cfg, port):
-    """Fresh WARP device -> its own egress address. usque owns the whole dance:
-    registration, HTTPS enrol, MASQUE switch. Backs off hard on 429/403."""
+    """Fresh WARP device -> its own egress address. usque owns the whole dance:\nregistration, HTTPS enrol, MASQUE switch. Backs off hard on 429/403."""
     os.makedirs(os.path.dirname(conf_path(cfg, port)), exist_ok=True)
     # register into a temp path: usque asks "overwrite? (y/n)" when the config
     # exists, and a prompt-less subprocess dies on the EOF
@@ -172,8 +224,7 @@ def spawn(cfg, port, st=None):
     return p.pid
 
 def _find_proc(port):
-    """A slot whose stored pid is stale still owns a live usque - find it by its
-    config path; register/rotate lie otherwise (bind: in use)."""
+    """A slot whose stored pid is stale still owns a live usque - find it by its\nconfig path; register/rotate lie otherwise (bind: in use)."""
     if WIN: return _find_proc_win(port)
     needle = os.path.join("node-%s" % port, "config.json").encode()
     for pid in os.listdir("/proc"):
@@ -252,8 +303,71 @@ def _measure_via_socks(cfg, port):
     if "ip" not in out: return {"error": (r.stderr or r.stdout or "no trace")[:80]}
     return {"ip": out.get("ip"), "warp": out.get("warp") == "on", "colo": out.get("colo")}
 
+# ---------------------------------------------------------------- rotation
+
+def rotate_ports(cfg, q="all"):
+    """Rotate one port or every port, under the state lock. Returns the list of
+    ports that came back with an address."""
+    with STATE_LOCK:
+        st = load_state().get("nodes", {})
+        ports = [k for k in st] if q == "all" else [q]
+        done = []
+        for p in ports:
+            if st.get(p, {}).get("drained"): continue
+            wrapper = {"nodes": st}
+            old_ip = (st[p].get("measure") or {}).get("ip")
+            got, mode = rotate_node(cfg, int(p), wrapper, old_ip)
+            if got:
+                st[p]["measure"] = {"ip": got, "warp": True}
+                st[p]["measured_at"] = time.time(); st[p]["rotated_at"] = time.time()
+                log(f"{p} rotated ({mode}) -> {got}")
+                done.append(p)
+            else:
+                log(f"{p} rotate FAILED")
+                notify(cfg, f"node {p} failed to rotate", "error")
+        save_state(st)
+        return done
+
+def rotate_node(cfg, port, st, old_ip=None):
+    """Reconnect first, re-register only if that did not change the address.
+
+    A usque reconnect alone usually lands on a new egress address (new tunnel,
+    same registration), and costs ~5s; a full register() costs ~20-40s and burns
+    a new device. Short intervals are only affordable because of this order.
+    Returns (ip, "reconnect" | "re-register") or (None, mode)."""
+    nodes = st.setdefault("nodes", {})
+    n = nodes.setdefault(str(port), {"registered_at": 0, "drained": False})
+    stop_node(port, st)
+    if os.path.exists(conf_path(cfg, port)):
+        spawn(cfg, port, st); time.sleep(3)
+        ip = measure(cfg, port).get("ip") if sock_open(port) else None
+        if ip and ip != old_ip:
+            # reset the clock here: the due check reads registered_at, so leaving
+            # it alone would make this node "due" again on every single cycle
+            n["registered_at"] = time.time()
+            return ip, "reconnect"
+        # reconnect came back on the same address (or not at all)
+        stop_node(port, st)
+    r = register(cfg, port)
+    if not r:
+        return None, "re-register"
+    n.update(r); spawn(cfg, port, st); time.sleep(3)
+    got = measure(cfg, port).get("ip") if sock_open(port) else None
+    tries = 1
+    while old_ip and got == old_ip and tries < 3:
+        # CF can hand the same colo address back; we want a different one
+        stop_node(port, st); r = register(cfg, port)
+        if not r: break
+        n.update(r); spawn(cfg, port, st); time.sleep(3); tries += 1
+        got = measure(cfg, port).get("ip") if sock_open(port) else None
+    return got, "re-register"
+
 # ---------------------------------------------------------------- ensure cycle
 def ensure(cfg):
+    with STATE_LOCK:
+        return _ensure(cfg)
+
+def _ensure(cfg):
     st = load_state()
     nodes = st.setdefault("nodes", {})
     changed = []
@@ -270,7 +384,9 @@ def ensure(cfg):
             if not os.path.exists(conf_path(cfg, int(port))):
                 r = register(cfg, int(port))
                 if not r:
-                    log(f"{port}: registration failed"); continue
+                    log(f"{port}: registration failed")
+                    notify(cfg, f"node {port} could not register (Cloudflare refused)", "error")
+                    continue
                 n.update(r); changed.append(f"{port} registered")
             spawn(cfg, port, st)
             time.sleep(3)   # usque needs a moment to bind its socks listener
@@ -311,6 +427,7 @@ def ensure(cfg):
                 changed.append(f"{p} re-registered (dedupe)")
             else:
                 nodes[p]["drained"] = True; changed.append(f"{p} DRAINED (no distinct address)")
+                notify(cfg, f"node {p} drained: no distinct egress address", "error")
 
     # 3) rotate due
     now = time.time()
@@ -319,23 +436,12 @@ def ensure(cfg):
         if now - (n.get("registered_at") or 0) >= cfg["rotate_interval_s"]:
             log(f"{port}: rotation due")
             old_ip = (n.get("measure") or {}).get("ip")
-            stop_node(port, st)
-            r = register(cfg, int(port))
-            if r:
-                n.update(r); spawn(cfg, int(port), st)
-                time.sleep(3)
-                got = measure(cfg, int(port)).get("ip") if sock_open(int(port)) else None
-                tries = 1
-                while old_ip and got == old_ip and tries < 3:
-                    # same egress came back — re-register once more (CF can hand the
-                    # same colo address back); we want a DIFFERENT quota bucket
-                    stop_node(port, st); r = register(cfg, int(port))
-                    if not r: break
-                    n.update(r); spawn(cfg, int(port), st); time.sleep(3); tries += 1
-                    got = measure(cfg, int(port)).get("ip") if sock_open(int(port)) else None
-                n["measure"] = {"ip": got, "warp": True} if got else {}
+            got, mode = rotate_node(cfg, int(port), st, old_ip)
+            if got:
+                n["measure"] = {"ip": got, "warp": True}
                 n["measured_at"] = time.time()
-                changed.append(f"{port} rotated" + (f" -> {got}" if got else ""))
+                n["rotated_at"] = time.time()
+                changed.append(f"{port} rotated ({mode})" + (f" -> {got}" if got else ""))
             else:
                 n["registered_at"] = now - cfg["rotate_interval_s"] + 60  # retry next cycle
 
@@ -349,6 +455,8 @@ def ensure(cfg):
         # leave 9router's pools created AND tested, or it reaps them
         try: install_9r(cfg)
         except Exception as e: log(f"9r install failed: {e}")
+    if alive == 0 and nodes:
+        notify(cfg, "pool has no egress: every node is down", "error")
     return {"alive": alive, "drained": drained, "distinct_ips": len(distinct), "changed": changed}
 
 def status(cfg):
@@ -418,40 +526,76 @@ def install_9r(cfg):
     return created
 
 # ---------------------------------------------------------------- UI
-INDEX = """<!doctype html><meta charset=utf-8><title>warp-pool</title>
-<style>body{background:#0b0d12;color:#dfe3ea;font:14px/1.5 ui-monospace,Consolas,monospace;padding:24px}
-h1{color:#ff6b57;font-size:20px}table{border-collapse:collapse;margin-top:14px;min-width:640px}
-th,td{border:1px solid #232838;padding:6px 12px;text-align:left}th{color:#8a93a8}
-.up{color:#38d97a}.down{color:#ff5c5c}.drained{color:#ffb020}
-button{background:#1a2030;color:#dfe3ea;border:1px solid #2a3350;border-radius:6px;padding:5px 14px;cursor:pointer}
-button:hover{background:#242d47}#j{white-space:pre;margin-top:18px;color:#9fb0d0;font-size:12px}</style>
-<h1>warp-pool — healthy egress rotation</h1><div id=t>loading…</div>
-<div style="margin-top:14px"><button onclick="cmd('ensure')">run ensure</button>
-<button onclick="cmd('rotate?port=all')">rotate all</button></div><pre id=j></pre>
-<script>
-async function load(){const r=await (await fetch('api/status')).json();
- const h=['<table><tr><th>port</th><th>state</th><th>egress ip</th><th>warp</th><th>age</th><th>pid</th><th></th></tr>'];
- for(const n of r){h.push(`<tr><td>${n.port}</td><td class=${n.state}>${n.state}</td><td>${n.ip||'—'}</td>
- <td>${n.warp?'on':'—'}</td><td>${n.age_min}m</td><td>${n.pid||''}</td>
- <td><button onclick="cmd('rotate?port=${n.port}')">rotate</button></td></tr>`)}
- document.getElementById('t').innerHTML=h.join('')+'</table>';load2()}
- async function load2(){const r=await (await fetch('api/log')).json();document.getElementById('j').textContent=r.changed.join('\\n')||'no changes yet'}
- async function cmd(q){const r=await (await fetch('api/'+q,{method:'POST'})).json();document.getElementById('j').textContent=JSON.stringify(r,null,1);load()}
- load();setInterval(load,15000)</script>"""
+INDEX = """<!doctype html><meta charset=utf-8><title>warp-pool</title>\n<style>body{background:#0b0d12;color:#dfe3ea;font:14px/1.5 ui-monospace,Consolas,monospace;padding:24px}\nh1{color:#ff6b57;font-size:20px}table{border-collapse:collapse;margin-top:14px;min-width:640px}\nth,td{border:1px solid #232838;padding:6px 12px;text-align:left}th{color:#8a93a8}\n.up{color:#38d97a}.down{color:#ff5c5c}.drained{color:#ffb020}\nbutton{background:#1a2030;color:#dfe3ea;border:1px solid #2a3350;border-radius:6px;padding:5px 14px;cursor:pointer}\nbutton:hover{background:#242d47}#j{white-space:pre;margin-top:18px;color:#9fb0d0;font-size:12px}</style>\n<h1>warp-pool — healthy egress rotation</h1><div id=t>loading…</div>\n<div style="margin-top:14px"><button onclick="cmd('ensure')">run ensure</button>\n<button onclick="cmd('rotate?port=all')">rotate all</button></div><pre id=j></pre>\n<script>\nasync function load(){const r=await (await fetch('api/status')).json();\nconst h=['<table><tr><th>port</th><th>state</th><th>egress ip</th><th>warp</th><th>age</th><th>pid</th><th></th></tr>'];\nfor(const n of r){h.push(`<tr><td>${n.port}</td><td class=${n.state}>${n.state}</td><td>${n.ip||'—'}</td>\n<td>${n.warp?'on':'—'}</td><td>${n.age_min}m</td><td>${n.pid||''}</td>\n<td><button onclick="cmd('rotate?port=${n.port}')">rotate</button></td></tr>`)}\ndocument.getElementById('t').innerHTML=h.join('')+'</table>';load2()}\nasync function load2(){const r=await (await fetch('api/log')).json();document.getElementById('j').textContent=r.changed.join('\\n')||'no changes yet'}\nasync function cmd(q){const r=await (await fetch('api/'+q,{method:'POST'})).json();document.getElementById('j').textContent=JSON.stringify(r,null,1);load()}\nload();setInterval(load,15000)</script>"""
 
 
 def _public_cfg(cfg):
     """Config the UI needs, secrets omitted."""
     n9 = cfg.get("nine_router") or {}
+    wh = cfg.get("webhook") or {}
     return {"nodes": cfg.get("nodes"), "rotate_interval_s": cfg.get("rotate_interval_s"),
-            "usque_dns": cfg.get("usque_dns"),
+            "base_port": cfg.get("base_port"),
+            "usque_dns": cfg.get("usque_dns"), "measure_url": cfg.get("measure_url"),
+            "webhook": {"enabled": bool(wh.get("enabled")), "url": wh.get("url") or "",
+                        "min_level": wh.get("min_level") or "warn"},
             "nine_router": {"enabled": bool(n9.get("enabled")), "base_url": n9.get("base_url"),
+                            "pool_prefix": n9.get("pool_prefix") or "warp-",
                             "connected": bool(n9.get("cli_token"))},
+            "ui_bind": cfg.get("ui_bind"), "ui_port": cfg.get("ui_port"),
             "path": HERE}
+
+def tick_loop(interval=15):
+    """Self-driving rotation: nobody else calls ensure() when there is no cron,
+    so without this the pool never rotates. 15s between cycles because one due
+    node's rotation (reconnect, or register+spawn+measure+retries) takes 5-40s."""
+    time.sleep(2)   # let the first window load before the first cycle
+    standing = False
+    while True:
+        lock = None
+        try:
+            lock = _tick_holder()
+            if lock is None:
+                if not standing:
+                    log("tick: another process is already ticking - standing down")
+                    standing = True
+            else:
+                if standing:
+                    log("tick: rotation is ours again"); standing = False
+                r = ensure(load_cfg())
+                if r.get("changed"): log(f"tick: {', '.join(r['changed'])}")
+        except Exception as e:
+            log(f"tick: {e}")
+        finally:
+            if lock is not None:
+                try: lock.close()
+                except OSError: pass
+        time.sleep(interval)
+
+def _tick_holder():
+    """Cross-process single-writer guard for the rotation tick.
+
+    The daemon, the UI server and a hand-run `ensure` all tick the same pool.
+    Without this they rotate the same node twice and Cloudflare starts
+    rate-limiting the registrations. Returns the open lock file, or None when
+    somebody else holds the lock (the caller stands down for that cycle)."""
+    f = open(os.path.join(HERE, ".tick.lock"), "a+b")
+    try:
+        if WIN:
+            import msvcrt
+            f.seek(0, os.SEEK_END)
+            if f.tell() == 0:
+                f.write(b"0"); f.flush()
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close(); return None
+    return f
 
 def serve(cfg):
     import http.server, threading
-    LOGBOX = {"changed": []}
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a): pass
         def _send(self, code, body, ctype="application/json"):
@@ -465,7 +609,7 @@ def serve(cfg):
                 except OSError:
                     self._send(200, INDEX, "text/html; charset=utf-8")
             elif self.path.startswith("/api/status"): self._send(200, json.dumps(status(load_cfg())))
-            elif self.path.startswith("/api/log"): self._send(200, json.dumps(LOGBOX))
+            elif self.path.startswith("/api/log"): self._send(200, json.dumps({"changed": _events()}))
             elif self.path.startswith("/api/config"): self._send(200, json.dumps(_public_cfg(load_cfg())))
             elif self.path.endswith(".svg") or self.path.endswith(".ico"):
                 self._send(404, "{}")
@@ -473,22 +617,10 @@ def serve(cfg):
         def do_POST(self):
             c = load_cfg()
             if self.path.startswith("/api/ensure"):
-                r = ensure(c); LOGBOX["changed"] = r["changed"] or LOGBOX["changed"]; self._send(200, json.dumps(r))
+                r = ensure(c); self._send(200, json.dumps(r))
             elif self.path.startswith("/api/rotate"):
                 q = self.path.split("port=")[-1] if "port=" in self.path else "all"
-                st = load_state().get("nodes", {})
-                ports = [k for k in st] if q == "all" else [q]
-                done = []
-                for p in ports:
-                    if st.get(p, {}).get("drained"): continue
-                    wrapper = {"nodes": st}
-                    stop_node(p, wrapper); r = register(c, int(p))
-                    if r:
-                        st[p].update(r); spawn(c, int(p), wrapper); time.sleep(3)
-                        got = measure(c, int(p)).get("ip") if sock_open(int(p)) else None
-                        st[p]["measure"] = {"ip": got, "warp": True} if got else {}
-                        st[p]["measured_at"] = time.time(); done.append(p)
-                save_state(st)
+                done = rotate_ports(c, q)
                 self._send(200, json.dumps({"rotated": done}))
             elif self.path.startswith("/api/settings"):  # settable at runtime: IR mode, node count, rotation
                 body = self._body(); out = {}
@@ -496,30 +628,76 @@ def serve(cfg):
                     if body.get("usque_dns") is not None:
                         c["usque_dns"] = body["usque_dns"].strip() or "1.1.1.1"
                         out["usque_dns"] = c["usque_dns"]
+                    if body.get("base_port"):
+                        # the pool is keyed by port: moving it drains the old slots
+                        # rather than silently leaving orphan usque processes live
+                        new_base = max(1024, min(65000, int(body["base_port"])))
+                        if new_base != c["base_port"]:
+                            with STATE_LOCK:
+                                stn = load_state(); nodes = stn.setdefault("nodes", {})
+                                for p in list(nodes):
+                                    stop_node(p, {"nodes": nodes})
+                                    nodes[p]["drained"] = True
+                                save_state(stn)
+                            c["base_port"] = new_base
+                            out["base_port"] = new_base
                     if body.get("nodes"):
                         c["nodes"] = max(0, int(body["nodes"]))
-                        stn = load_state()
-                        want = c["nodes"]
-                        nodes = stn.setdefault("nodes", {})
-                        while len([n for n in nodes if not nodes[n].get("drained")]) > want:
-                            # pick newest slot, stop+drain rather than delete
-                            free = [p for p in nodes if not nodes[p].get("drained")]
-                            p = max(free, key=lambda x: nodes[x].get("registered_at", 0))
-                            stop_node(p, {"nodes": nodes}); nodes[p]["drained"] = True
-                        save_state(stn)
-                        ensure(c)
+                        with STATE_LOCK:
+                            stn = load_state()
+                            want = c["nodes"]
+                            nodes = stn.setdefault("nodes", {})
+                            while len([n for n in nodes if not nodes[n].get("drained")]) > want:
+                                # pick newest slot, stop+drain rather than delete
+                                free = [p for p in nodes if not nodes[p].get("drained")]
+                                p = max(free, key=lambda x: nodes[x].get("registered_at", 0))
+                                stop_node(p, {"nodes": nodes}); nodes[p]["drained"] = True
+                            save_state(stn)
+                        ensure(c)   # runs under the same lock
                         out["nodes"] = c["nodes"]
                     if body.get("nine_router_enabled") is not None:
                         c["nine_router"]["enabled"] = bool(body["nine_router_enabled"])
                         out["nine_router_enabled"] = c["nine_router"]["enabled"]
+                    if body.get("nine_router_url"):
+                        c["nine_router"]["base_url"] = body["nine_router_url"].rstrip("/")
+                        out["nine_router_url"] = c["nine_router"]["base_url"]
+                    if body.get("nine_router_prefix"):
+                        c["nine_router"]["pool_prefix"] = body["nine_router_prefix"]
+                        out["nine_router_prefix"] = c["nine_router"]["pool_prefix"]
                     if body.get("rotate_interval_s"):
-                        c["rotate_interval_s"] = max(30, int(body["rotate_interval_s"]))
+                        c["rotate_interval_s"] = max(10, int(body["rotate_interval_s"]))
                         out["rotate_interval_s"] = c["rotate_interval_s"]
-                    save_cfg(c); LOGBOX["changed"] = LOGBOX.get("changed", []) + [f"settings updated {out}"]
-                    if c["nine_router"].get("enabled"):
-                        try: install_9r(c); LOGBOX["changed"].append("9router pools synced")
-                        except Exception as e: LOGBOX["changed"].append(f"9router sync failed: {e}")
+                    if body.get("measure_url"):
+                        c["measure_url"] = body["measure_url"]
+                        out["measure_url"] = c["measure_url"]
+                    if body.get("webhook_url") is not None:
+                        c["webhook"]["url"] = body["webhook_url"]
+                        c["webhook"]["enabled"] = bool(body.get("webhook_enabled"))
+                        c["webhook"]["min_level"] = body.get("webhook_level") or "warn"
+                        out["webhook"] = {"enabled": c["webhook"]["enabled"],
+                                          "min_level": c["webhook"]["min_level"]}
+                    if body.get("ui_bind"):
+                        c["ui_bind"] = body["ui_bind"]
+                        out["ui_bind"] = c["ui_bind"]
+                    if body.get("ui_port"):
+                        c["ui_port"] = max(1024, min(65000, int(body["ui_port"])))
+                        out["ui_port"] = c["ui_port"]
+                    save_cfg(c); log(f"settings updated {out}")
+                    if c["nine_router"].get("enabled") and not out.get("usque_dns"):
+                        try: install_9r(c)
+                        except Exception as e: log(f"9router sync failed: {e}")
                 self._send(200, json.dumps(out or {"ok": True}))
+            elif self.path.startswith("/api/webhook-test"):
+                # test an unsaved URL too, so "send test" works before save
+                body = self._body(); url = (body.get("url") or "").strip()
+                if not url:
+                    self._send(200, json.dumps({"ok": False, "error": "no url"})); return
+                probe = load_cfg(); probe["webhook"] = {"enabled": True, "url": url,
+                                                        "min_level": "info"}
+                _notify_last.clear()   # a test must actually fire
+                ok = notify(probe, "UnlProxy webhook test - if you can read this, alerts work",
+                            "info", dedupe_s=0)
+                self._send(200, json.dumps({"ok": bool(ok)}))
             elif self.path.startswith("/api/revive"):
                 # drained nodes: isinstance check no longer needed now that slots keep the label
                 st = load_state().get("nodes", {})
@@ -535,14 +713,107 @@ def serve(cfg):
                 return {}
     srv = http.server.ThreadingHTTPServer((cfg["ui_bind"], cfg["ui_port"]), H)
     log(f"UI on http://{cfg['ui_bind']}:{cfg['ui_port']}/")
+    threading.Thread(target=tick_loop, daemon=True, name="tick").start()
     srv.serve_forever()
 
 # ---------------------------------------------------------------- main
+
+# ---------------------------------------------------------------- cli mode
+def _fmt_table(rows):
+    if not rows: return "no nodes"
+    head = f"{'PORT':<7}{'STATE':<9}{'EGRESS IP':<40}{'WARP':<6}{'AGE':<6}PID"
+    out = [head, "-" * len(head)]
+    for r in rows:
+        out.append(f"{r['port']:<7}{r['state']:<9}{(r['ip'] or '-'):<40}"
+                   f"{('on' if r['warp'] else '-'):<6}{str(r['age_min']) + 'm':<6}{r['pid'] or ''}")
+    return chr(10).join(out)
+
+def _ui_url(cfg):
+    host = "127.0.0.1" if cfg["ui_bind"] in ("0.0.0.0", "") else cfg["ui_bind"]
+    return f"http://{host}:{cfg['ui_port']}/"
+
+def _port_busy(port, host="127.0.0.1"):
+    try:
+        with socket.create_connection((host, int(port)), timeout=1): return True
+    except OSError:
+        return False
+
+def cli(cfg):
+    """Interactive console: same verbs as the UI, no browser."""
+    print("UnlProxy cli - type 'help' for commands, 'q' to leave\n")
+    print(_fmt_table(status(cfg)) + "\n")
+    cmds = {"help": "this list", "status": "node table", "ensure": "health + dedupe + rotations due",
+            "up": "start every node", "down": "stop every node", "rotate": "rotate all nodes",
+            "rotate <port>": "rotate one node", "nodes <n>": "grow/shrink the pool",
+            "9r": "create + test pools in 9router", "url": "print the UI address",
+            "webhook [url|off]": "set the alert webhook",
+            "config": "print the live config", "log": "last events", "q": "quit"}
+    while True:
+        try:
+            line = input("unlproxy> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(); return 0
+        if not line: continue
+        parts = line.split(); cmd = parts[0].lower(); arg = parts[1] if len(parts) > 1 else ""
+        try:
+            if cmd in ("q", "quit", "exit"): return 0
+            if cmd in ("help", "h", "?"):
+                for k, v in cmds.items(): print(f"  {k:<16}{v}")
+            elif cmd == "status":
+                print(_fmt_table(status(cfg)))
+            elif cmd in ("ensure", "up", "down"):
+                if cmd == "down":
+                    for p in load_state().get("nodes", {}): stop_node(p)
+                    log("all stopped")
+                else:
+                    if cmd == "up":
+                        st = load_state(); st.setdefault("nodes", {})
+                        for i in range(cfg["nodes"]):
+                            st["nodes"].setdefault(str(cfg["base_port"] + i), {"registered_at": 0, "drained": False})
+                        save_state(st)
+                    r = ensure(cfg); print(json.dumps(r, indent=1))
+                print(_fmt_table(status(cfg)))
+            elif cmd == "rotate":
+                print("rotated:", rotate_ports(cfg, arg or "all")); print(_fmt_table(status(cfg)))
+            elif cmd == "nodes":
+                n = int(arg); c = load_cfg(); c["nodes"] = max(0, n); save_cfg(c)
+                st = load_state(); nodes = st.setdefault("nodes", {})
+                while len([k for k in nodes if not nodes[k].get("drained")]) > c["nodes"]:
+                    free = [k for k in nodes if not nodes[k].get("drained")]
+                    p = max(free, key=lambda x: nodes[x].get("registered_at", 0))
+                    stop_node(p, {"nodes": nodes}); nodes[p]["drained"] = True
+                save_state(st)
+                print(json.dumps(ensure(c), indent=1)); print(_fmt_table(status(c)))
+            elif cmd == "9r":
+                print("pools:", install_9r(load_cfg()))
+            elif cmd == "url":
+                print(_ui_url(cfg))
+            elif cmd == "webhook":
+                c = load_cfg()
+                if arg == "off":
+                    c["webhook"]["enabled"] = False; save_cfg(c); print("webhook off")
+                elif arg:
+                    c["webhook"].update({"url": arg, "enabled": True}); save_cfg(c)
+                    _notify_last.clear()
+                    print("webhook test:", "delivered" if notify(c, "UnlProxy webhook test", "info", 0)
+                          else "failed - see the event log")
+                else:
+                    print(json.dumps(c.get("webhook"), indent=1))
+            elif cmd == "config":
+                print(json.dumps(load_cfg(), indent=1))
+            elif cmd == "log":
+                print("\n".join(_events()[-25:]) or "no events yet")
+            else:
+                print(f"unknown: {cmd}  (try help)")
+        except Exception as e:
+            print(f"error: {e}")
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__); return 2
     cmd = sys.argv[1]
     cfg = load_cfg()
+    if cmd == "cli": return cli(cfg)
     if cmd == "setup":
         print("UnlProxy setup — 2 answers, everything else is automatic\n")
         # MASQUE over 443 needs no relay, so there is no "where does this run" question
@@ -563,6 +834,24 @@ def main():
         if serve_q:
             print("(Ctrl+C to stop the UI; pool keeps running)\n")
             serve(cfg)
+        return 0
+    if cmd == "config":
+        # headless tune: config --nodes 4 --dns 1.1.1.1 --9r --no-9r --rotate 300
+        a = sys.argv[1:]
+        if "--nodes" in a: cfg["nodes"] = max(1, int(a[a.index("--nodes") + 1]))
+        if "--dns" in a: cfg["usque_dns"] = a[a.index("--dns") + 1]
+        if "--rotate" in a: cfg["rotate_interval_s"] = max(10, int(a[a.index("--rotate") + 1]))
+        if "--9r" in a: cfg["nine_router"]["enabled"] = True
+        if "--no-9r" in a: cfg["nine_router"]["enabled"] = False
+        if "--webhook" in a:
+            cfg["webhook"]["url"] = a[a.index("--webhook") + 1]; cfg["webhook"]["enabled"] = True
+        if "--no-webhook" in a: cfg["webhook"]["enabled"] = False
+        if "--port" in a: cfg["base_port"] = max(1024, int(a[a.index("--port") + 1]))
+        if "--ui-port" in a: cfg["ui_port"] = max(1024, int(a[a.index("--ui-port") + 1]))
+        save_cfg(cfg)
+        if "--quiet" not in a:
+            print(json.dumps({k: cfg[k] for k in ("nodes", "base_port", "rotate_interval_s",
+                                                  "usque_dns", "webhook", "ui_port")}, indent=1))
         return 0
     if cmd == "init":
         if not os.path.exists(CONFIG_PATH): save_cfg(cfg)
@@ -586,18 +875,52 @@ def main():
         print(json.dumps(status(cfg), indent=1)); return 0
     if cmd == "rotate":
         q = sys.argv[2] if len(sys.argv) > 2 else "all"
-        st = load_state().get("nodes", {})
-        ports = [k for k in st] if q == "all" else [q]
-        for p in ports:
-            stop_node(p, {"nodes": st}); r = register(cfg, int(p))
-            if r:
-                st[p].update(r); spawn(cfg, int(p), {"nodes": st}); time.sleep(3)
-                got = measure(cfg, int(p)).get("ip") if sock_open(int(p)) else None
-                st[p]["measure"] = {"ip": got, "warp": True} if got else {}
-                st[p]["measured_at"] = time.time(); log(f"{p} rotated -> {got or '?'}")
-            else: log(f"{p} rotate FAILED")
-        save_state({"nodes": st}); return 0
+        print(json.dumps({"rotated": rotate_ports(cfg, q)})); return 0
     if cmd == "serve": serve(cfg); return 0
+    if cmd == "ui":
+        # what `unlp` runs: bring the UI up and open it in the browser
+        url = _ui_url(cfg)
+        if _port_busy(cfg["ui_port"]):
+            print(f"UnlProxy UI is already running: {url}")
+            try: webbrowser.open(url)
+            except Exception: pass
+            return 0
+        ensure(cfg)   # pool up before the browser opens, so the table is not empty
+        threading.Thread(target=serve, args=(cfg,), daemon=True, name="ui").start()
+        for _ in range(40):
+            time.sleep(0.25)
+            if _port_busy(cfg["ui_port"]): break
+        try: webbrowser.open(url)
+        except Exception as e: print("could not open a browser:", e)
+        print(f"UnlProxy UI: {url}   (Ctrl+C to stop)")
+        try:
+            while True: time.sleep(3600)
+        except KeyboardInterrupt:
+            print()
+            return 0
+    if cmd == "daemon":
+        # pool only, no UI: bring everything up and keep it rotating
+        r = ensure(cfg)
+        log(json.dumps(r))
+        if r["alive"] == 0:
+            print("no node came up - see nodes/*.log"); return 1
+        print(f"pool up: {r['alive']} node(s), {r['distinct_ips']} distinct egress address(es)")
+        print("rotation runs on its own here - Ctrl+C to stop the loop (the nodes stay up)")
+        tick_loop()
+        return 0
+    if cmd == "install":
+        # one command: config + usque + nodes up + a self-driving rotation loop
+        if not os.path.exists(CONFIG_PATH): save_cfg(cfg)
+        cfg["nodes"] = max(1, cfg.get("nodes", 3)); save_cfg(cfg)
+        download_usque(cfg)
+        os.makedirs(os.path.join(HERE, "nodes"), exist_ok=True)
+        r = ensure(cfg); log(json.dumps(r))
+        if r["alive"] == 0:
+            print("no node came up - see nodes/*.log"); return 1
+        print(f"pool ready: {r['alive']} node(s), {r['distinct_ips']} distinct egress address(es)")
+        print("rotation runs on its own - Ctrl+C to stop (the nodes stay up)")
+        tick_loop()
+        return 0
     if cmd == "install-9r": install_9r(cfg); return 0
     print(__doc__); return 2
 
