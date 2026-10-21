@@ -890,7 +890,12 @@ def _pids_matching(needle):
     return pids
 
 def stop_daemon():
-    """Stop every other `warppool.py` daemon/serve/ui for this install."""
+    """Stop every other `warppool.py` daemon/serve/ui for this install.
+
+    Only the process is asked to die; the port is then waited on, because the
+    old daemon holding ui_port is what makes a restart look like it did nothing.
+    """
+    cfg = load_cfg()
     pids = sorted(set(p for p in _pids_matching("warppool.py") if p != os.getpid()))
     for pid in pids:
         try:
@@ -898,16 +903,24 @@ def stop_daemon():
             else: os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
+    for _ in range(30):                 # up to 6s for the port to come free
+        if not _port_busy(cfg["ui_port"]): break
+        time.sleep(0.2)
     log(f"stopped {len(pids)} background process(es)")
     return pids
 
 def _spawn_daemon():
-    """Re-launch ourselves detached, so `restart` returns."""
+    """Re-launch ourselves detached, so `restart` returns.
+
+    The script path comes from __file__, not from cwd: a launch that inherits
+    the caller's directory runs whatever copy happens to be there, which is how
+    a stale build kept answering after an update."""
+    script = os.path.abspath(__file__)
     kw = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
-          "stdin": subprocess.DEVNULL, "cwd": HERE}
+          "stdin": subprocess.DEVNULL, "cwd": os.path.dirname(script)}
     if not WIN: kw["start_new_session"] = True
-    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "daemon"], **kw)
-    print(f"daemon restarted (pid {p.pid})")
+    p = subprocess.Popen([sys.executable, script, "daemon"], **kw)
+    print(f"daemon restarted (pid {p.pid}, {VERSION}, {script})")
     return 0
 
 def stop_all():
