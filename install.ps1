@@ -55,7 +55,11 @@ if not exist "%UNLP_DIR%\warppool.py" (
   exit /b 1
 )
 cd /d "%UNLP_DIR%" 2>nul
-"$($py.Source)" "%UNLP_DIR%\warppool.py" %*
+if "%~1"=="" (
+  "$($py.Source)" "%UNLP_DIR%\warppool.py" ui
+) else (
+  "$($py.Source)" "%UNLP_DIR%\warppool.py" %*
+)
 "@
 Set-Content -Path (Join-Path $bin 'unlp.cmd') -Value $launcher -Encoding ASCII
 $userPath = [Environment]::GetEnvironmentVariable('PATH','User')
