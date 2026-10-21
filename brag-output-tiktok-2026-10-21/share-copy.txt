@@ -1,1 +1,0 @@
-A ban only sticks if your egress address sits still. UnlProxy keeps a pool of Cloudflare WARP nodes, rotates each one on its own clock, and hands you a SOCKS5 port that is a different address whenever you need it to be — no docker, no TUN, no admin, one Python file.
