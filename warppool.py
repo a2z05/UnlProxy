@@ -61,7 +61,7 @@ DEFAULTS = {
 }
 
 STALE_MEASURE_S = 150
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 REPO = "a2z05/UnlProxy"
 RAW = f"https://raw.githubusercontent.com/{REPO}/master"
 SELF_FILES = ("warppool.py", "ui.html", "unlp", "unlp.cmd", "install.sh", "install.ps1",
