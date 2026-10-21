@@ -36,7 +36,7 @@ warppool.py rotate [p|all]  force a rotation now (reconnect, else re-register)
 warppool.py serve           UI on ui_port (default 127.0.0.1:8180) + rotating tick
 warppool.py install-9r      push nodes into 9router's proxy pools (CLI token)
 """
-import json, os, re, signal, socket, ssl, subprocess, sys, time, urllib.request, urllib.error, hashlib, base64, random, string, threading, webbrowser
+import json, os, re, signal, socket, ssl, subprocess, sys, time, urllib.request, urllib.error, hashlib, base64, random, string, threading, webbrowser, shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("WARPPOOL_CONFIG", os.path.join(HERE, "config.json"))
@@ -61,6 +61,11 @@ DEFAULTS = {
 }
 
 STALE_MEASURE_S = 150
+VERSION = "2.1.0"
+REPO = "a2z05/UnlProxy"
+RAW = f"https://raw.githubusercontent.com/{REPO}/master"
+SELF_FILES = ("warppool.py", "ui.html", "unlp", "unlp.cmd", "install.sh", "install.ps1",
+              "config.example.json")
 
 # one writer at a time: the tick thread, the UI buttons and the CLI all touch
 # state.json, and interleaving them corrupts node state (pid/registered_at)
@@ -162,6 +167,54 @@ def download_usque(cfg):
     if not WIN:
         os.chmod(ubin(cfg), 0o755)
     return ubin(cfg)
+
+def latest_version(cfg, timeout=15):
+    """Newest release tag on GitHub, without the leading v. Raises on network failure."""
+    st, rel = http_json(cfg, f"https://api.github.com/repos/{REPO}/releases/latest",
+                        headers={"Accept": "application/vnd.github+json"}, timeout=timeout)
+    if st != 200 or not rel.get("tag_name"):
+        raise OSError(f"GitHub returned HTTP {st}")
+    return rel["tag_name"].lstrip("v"), rel.get("html_url") or ""
+
+def update_check(cfg):
+    """Compare this copy against the newest release. Never raises."""
+    out = {"current": VERSION, "latest": None, "url": "", "update": False, "error": None}
+    try:
+        out["latest"], out["url"] = latest_version(cfg)
+        out["update"] = out["latest"] != VERSION
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+def update(cfg):
+    """Download the release files over this copy. config.json, state.json and
+    nodes/ are untouched: those are the user's, not the program's."""
+    cur, url = latest_version(cfg)
+    if cur == VERSION:
+        return {"updated": False, "version": VERSION, "reason": "already current"}
+    here = HERE
+    saved = {}
+    try:
+        for name in SELF_FILES:
+            try:
+                data = fetch_text_cfg(cfg, f"{RAW}/{name}")
+            except Exception:
+                continue          # a file this release does not ship
+            dest = os.path.join(here, name)
+            if os.path.exists(dest):
+                with open(dest, "rb") as f: saved[name] = f.read()
+            tmp = dest + ".new"
+            with open(tmp, "wb") as f: f.write(data)
+            os.replace(tmp, dest)   # never leave a half-written warppool.py
+        log(f"updated {VERSION} -> {cur}")
+        return {"updated": True, "from": VERSION, "to": cur, "url": url}
+    except Exception as e:
+        for name, data in saved.items():          # put back what we replaced
+            try:
+                with open(os.path.join(here, name), "wb") as f: f.write(data)
+            except OSError: pass
+        log(f"update failed: {e}")
+        return {"updated": False, "version": VERSION, "error": str(e)}
 
 def fetch_text_cfg(cfg, url, timeout=60):
     op, to = opener(cfg, timeout)
@@ -429,11 +482,13 @@ def _ensure(cfg):
                 nodes[p]["drained"] = True; changed.append(f"{p} DRAINED (no distinct address)")
                 notify(cfg, f"node {p} drained: no distinct egress address", "error")
 
-    # 3) rotate due
+    # 3) rotate due (skipped while paused: the nodes stay up and healthy, they
+    # just keep their current address)
     now = time.time()
-    for port, n in list(nodes.items()):
-        if n.get("drained"): continue
-        if now - (n.get("registered_at") or 0) >= cfg["rotate_interval_s"]:
+    if not st.get("paused"):
+        for port, n in list(nodes.items()):
+            if n.get("drained"): continue
+            if now - (n.get("registered_at") or 0) < cfg["rotate_interval_s"]: continue
             log(f"{port}: rotation due")
             old_ip = (n.get("measure") or {}).get("ip")
             got, mode = rotate_node(cfg, int(port), st, old_ip)
@@ -457,7 +512,8 @@ def _ensure(cfg):
         except Exception as e: log(f"9r install failed: {e}")
     if alive == 0 and nodes:
         notify(cfg, "pool has no egress: every node is down", "error")
-    return {"alive": alive, "drained": drained, "distinct_ips": len(distinct), "changed": changed}
+    return {"alive": alive, "drained": drained, "distinct_ips": len(distinct),
+            "paused": bool(st.get("paused")), "changed": changed}
 
 def status(cfg):
     st = load_state().get("nodes", {})
@@ -599,15 +655,22 @@ def serve(cfg):
             self.send_response(code); self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
         def do_GET(self):
-            if self.path in ("/", "/index.html"):
+            # route on the path only: a cache-busting ?v=2 on the index URL used
+            # to miss every branch and return "{}" instead of the page
+            route = self.path.split("?", 1)[0]
+            if route in ("/", "/index.html"):
                 try:
                     self._send(200, open(os.path.join(HERE, "ui.html"), "rb").read(), "text/html; charset=utf-8")
                 except OSError:
                     self._send(200, INDEX, "text/html; charset=utf-8")
-            elif self.path.startswith("/api/status"): self._send(200, json.dumps(status(load_cfg())))
-            elif self.path.startswith("/api/log"): self._send(200, json.dumps({"changed": _events()}))
-            elif self.path.startswith("/api/config"): self._send(200, json.dumps(_public_cfg(load_cfg())))
-            elif self.path.endswith(".svg") or self.path.endswith(".ico"):
+            elif route.startswith("/api/status"): self._send(200, json.dumps(status(load_cfg())))
+            elif route.startswith("/api/log"): self._send(200, json.dumps({"changed": _events()}))
+            elif route.startswith("/api/config"): self._send(200, json.dumps(_public_cfg(load_cfg())))
+            elif route.startswith("/api/version"):
+                v = update_check(load_cfg())
+                v["paused"] = bool(load_state().get("paused"))
+                self._send(200, json.dumps(v))
+            elif route.endswith(".svg") or route.endswith(".ico"):
                 self._send(404, "{}")
             else: self._send(404, "{}")
         def do_POST(self):
@@ -683,6 +746,13 @@ def serve(cfg):
                         try: install_9r(c)
                         except Exception as e: log(f"9router sync failed: {e}")
                 self._send(200, json.dumps(out or {"ok": True}))
+            elif self.path.startswith("/api/pause"):
+                _set_paused(True); self._send(200, json.dumps({"paused": True}))
+            elif self.path.startswith("/api/resume"):
+                _set_paused(False); self._send(200, json.dumps({"paused": False}))
+            elif self.path.startswith("/api/update"):
+                # the new build only takes effect once this process restarts
+                self._send(200, json.dumps(update(load_cfg())))
             elif self.path.startswith("/api/webhook-test"):
                 # test an unsaved URL too, so "send test" works before save
                 body = self._body(); url = (body.get("url") or "").strip()
@@ -724,6 +794,128 @@ def _fmt_table(rows):
                    f"{('on' if r['warp'] else '-'):<6}{str(r['age_min']) + 'm':<6}{r['pid'] or ''}")
     return chr(10).join(out)
 
+HELP = """
+UnlProxy - WARP egress pool
+
+  unlp                       open the control UI
+  unlp <cmd>                 run any command below
+
+Pool
+  status                     node table (ports, egress, age, pid)
+  up / down                  start / stop every node
+  ensure                     one health + dedupe + rotate-due cycle
+  rotate [port]              rotate now (reconnect, else re-register)
+  pause / resume             stop / restart automatic rotation; nodes stay up
+  nodes <n>                  grow or shrink the pool
+  revive                     bring drained nodes back
+
+Run it
+  ui                         start the UI and open it         (ui off: see below)
+  ui off                     stop a UI started by this process
+  serve                      UI in the foreground (no browser)
+  daemon                     background service: pool + rotation + UI
+  cli                        interactive console
+  install                    first run: config + usque + pool + rotation
+
+Settings
+  config                     print the live config
+  config --nodes 4 --dns 1.1.1.1 --rotate 300 --9r --webhook URL
+  webhook                    show / set / clear the alert webhook
+  install-9r                 create + test pools in 9router
+
+Maintenance
+  version                    this build's version
+  update                     check for a newer release and install it
+  update --check             only check, do not install
+  uninstall                  stop everything and remove the install directory
+  help                       this list
+"""
+
+def _help():
+    print(HELP.strip())
+
+def _set_paused(on):
+    with STATE_LOCK:
+        st = load_state(); st["paused"] = bool(on); save_state(st)
+    log("rotation paused" if on else "rotation resumed")
+    return {"paused": bool(on)}
+
+def _ui_state(cfg):
+    return {"running": _port_busy(cfg["ui_port"]), "url": _ui_url(cfg)}
+
+def uninstall(keep_config=False):
+    """Stop every node and remove the app. Refuses to delete anything outside HERE."""
+    stop_all()
+    targets = SELF_FILES + ("assets", "bin", "scripts")
+    if not keep_config:
+        targets += ("config.json", "state.json", "nodes", "events.log", "daemon.log", ".tick.lock")
+    removed = []
+    for name in targets:
+        p = os.path.join(HERE, name)
+        if not os.path.exists(p): continue
+        try:
+            if os.path.isdir(p): shutil.rmtree(p)
+            else: os.remove(p)
+            removed.append(name)
+        except OSError as e:
+            log(f"uninstall: could not remove {name}: {e}")
+    return removed
+
+def _pids_matching(needle):
+    """PIDs whose command line contains `needle`, however the OS exposes them."""
+    if WIN:
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process | ForEach-Object "
+                 "{ \"$($_.ProcessId)|$($_.CommandLine)\" }"],
+                capture_output=True, text=True, timeout=30).stdout
+        except Exception:
+            return []
+        pids = []
+        for line in out.splitlines():
+            pid, _, cmdline = line.partition("|")
+            if pid.strip().isdigit() and needle in cmdline:
+                pids.append(int(pid))
+        return pids
+    pids = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit(): continue
+        try:
+            cmdline = open(f"/proc/{d}/cmdline", "rb").read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if needle in cmdline and int(d) != os.getpid():
+            pids.append(int(d))
+    return pids
+
+def stop_daemon():
+    """Stop every other `warppool.py` daemon/serve/ui for this install."""
+    pids = sorted(set(p for p in _pids_matching("warppool.py") if p != os.getpid()))
+    for pid in pids:
+        try:
+            if WIN: subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"], capture_output=True)
+            else: os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    log(f"stopped {len(pids)} background process(es)")
+    return pids
+
+def _spawn_daemon():
+    """Re-launch ourselves detached, so `restart` returns."""
+    kw = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+          "stdin": subprocess.DEVNULL, "cwd": HERE}
+    if not WIN: kw["start_new_session"] = True
+    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "daemon"], **kw)
+    print(f"daemon restarted (pid {p.pid})")
+    return 0
+
+def stop_all():
+    with STATE_LOCK:
+        st = load_state()
+        for p in list(st.get("nodes", {})): stop_node(p, st)
+        save_state(st)
+
 def _ui_url(cfg):
     host = "127.0.0.1" if cfg["ui_bind"] in ("0.0.0.0", "") else cfg["ui_bind"]
     return f"http://{host}:{cfg['ui_port']}/"
@@ -743,6 +935,8 @@ def cli(cfg):
             "rotate <port>": "rotate one node", "nodes <n>": "grow/shrink the pool",
             "9r": "create + test pools in 9router", "url": "print the UI address",
             "webhook [url|off]": "set the alert webhook",
+            "pause / resume": "stop / restart automatic rotation",
+            "version": "this build's version", "update": "check for + install a new release",
             "config": "print the live config", "log": "last events", "q": "quit"}
     while True:
         try:
@@ -784,6 +978,12 @@ def cli(cfg):
                 print("pools:", install_9r(load_cfg()))
             elif cmd == "url":
                 print(_ui_url(cfg))
+            elif cmd in ("pause", "resume"):
+                print(json.dumps(_set_paused(cmd == "pause")))
+            elif cmd == "version":
+                print(VERSION)
+            elif cmd == "update":
+                print(json.dumps(update(cfg), indent=1))
             elif cmd == "webhook":
                 c = load_cfg()
                 if arg == "off":
@@ -806,9 +1006,29 @@ def cli(cfg):
 
 def main():
     if len(sys.argv) < 2:
-        print(__doc__); return 2
+        _help(); return 2
     cmd = sys.argv[1]
     cfg = load_cfg()
+    if cmd in ("help", "-h", "--help"): _help(); return 0
+    if cmd in ("version", "-V", "--version"): print(VERSION); return 0
+    if cmd in ("pause", "resume"):
+        print(json.dumps(_set_paused(cmd == "pause"))); return 0
+    if cmd == "update":
+        if "--check" in sys.argv:
+            r = update_check(cfg)
+            print(json.dumps(r, indent=1))
+            return 0 if not r["error"] else 1
+        r = update(cfg)
+        print(json.dumps(r, indent=1))
+        if r.get("updated"): print("\nrestart the daemon/service to run the new build")
+        return 0 if not r.get("error") else 1
+    if cmd == "uninstall":
+        n = uninstall(keep_config="--keep-config" in sys.argv)
+        print(f"removed: {', '.join(n) or 'nothing'}")
+        print(f"left in place: {HERE}" if n else HERE)
+        print("to finish: delete the 'unlp' launcher from ~/.local/bin (or %LOCALAPPDATA%)"
+              if not WIN else "to finish: delete unlp.cmd from %USERPROFILE%\\.local\\bin")
+        return 0
     if cmd == "cli": return cli(cfg)
     if cmd == "setup":
         print("UnlProxy setup — 2 answers, everything else is automatic\n")
@@ -873,9 +1093,30 @@ def main():
         q = sys.argv[2] if len(sys.argv) > 2 else "all"
         print(json.dumps({"rotated": rotate_ports(cfg, q)})); return 0
     if cmd == "serve": serve(cfg); return 0
+    if cmd == "restart":
+        # stop our own background processes and hand back to the service manager;
+        # under nohup/startup nothing restarts us, so start the daemon here
+        stop_daemon()
+        time.sleep(1)
+        return _spawn_daemon()
     if cmd == "ui":
-        # what `unlp` runs: bring the UI up and open it in the browser
+        arg = sys.argv[2].lower() if len(sys.argv) > 2 else ""
         url = _ui_url(cfg)
+        if arg in ("off", "stop", "disable"):
+            # the UI lives in the daemon here, so "off" means remember not to
+            # serve it and let the daemon's next start honour it
+            cfg["ui_enabled"] = False; save_cfg(cfg)
+            if _port_busy(cfg["ui_port"]):
+                print(f"UI disabled for the next start. It is still answering on {url}")
+                print("to stop it now: unlp restart")
+            else:
+                print("UI disabled")
+            return 0
+        if arg in ("on", "enable"):
+            cfg["ui_enabled"] = True; save_cfg(cfg)
+            print("UI enabled")
+            return 0
+        cfg["ui_enabled"] = True; save_cfg(cfg)
         if _port_busy(cfg["ui_port"]):
             print(f"UnlProxy UI is already running: {url}")
             try: webbrowser.open(url)
@@ -902,7 +1143,7 @@ def main():
         if r["alive"] == 0:
             print("no node came up - see nodes/*.log"); return 1
         print(f"pool up: {r['alive']} node(s), {r['distinct_ips']} distinct egress address(es)")
-        if not _port_busy(cfg["ui_port"]):
+        if cfg.get("ui_enabled", True) and not _port_busy(cfg["ui_port"]):
             threading.Thread(target=serve, args=(cfg,), daemon=True, name="ui").start()
             print(f"UI: {_ui_url(cfg)}")
         print("rotation runs on its own here - Ctrl+C to stop the loop (the nodes stay up)")
@@ -918,7 +1159,7 @@ def main():
         if r["alive"] == 0:
             print("no node came up - see nodes/*.log"); return 1
         print(f"pool ready: {r['alive']} node(s), {r['distinct_ips']} distinct egress address(es)")
-        if not _port_busy(cfg["ui_port"]):
+        if cfg.get("ui_enabled", True) and not _port_busy(cfg["ui_port"]):
             threading.Thread(target=serve, args=(cfg,), daemon=True, name="ui").start()
             print(f"UI: {_ui_url(cfg)}")
         print("rotation runs on its own - Ctrl+C to stop (the nodes stay up)")

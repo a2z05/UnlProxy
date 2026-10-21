@@ -48,11 +48,41 @@ directory, any terminal:
 
 ```bash
 unlp               # open the control UI in your browser
-unlp cli           # interactive console
+unlp help          # every command, grouped
 unlp status        # one-shot node table
 unlp rotate        # rotate now
-unlp rotate 18091  # rotate one node
+unlp pause         # freeze rotation (nodes stay up)
+unlp update        # check for and install a newer release
 ```
+
+`unlp help` prints the full list. The ones you are likely to want:
+
+| | |
+|---|---|
+| `status` · `up` · `down` · `ensure` | inspect and drive the pool |
+| `rotate [port]` | a fresh address now rather than at the next tick |
+| `pause` / `resume` | stop automatic rotation without stopping the nodes |
+| `nodes <n>` | grow or shrink the pool |
+| `ui` / `ui off` | start the panel, or stop it serving on the next start |
+| `daemon` / `restart` | the background service, and bounce it |
+| `config` · `webhook` | settings from the shell |
+| `version` · `update [--check]` | what you run, and what is available |
+| `uninstall [--keep-config]` | stop everything and remove the install |
+
+## Updating
+
+The panel shows your version in the header and grows an **Update → vX.Y.Z**
+button when a newer release exists. From the shell:
+
+```bash
+unlp update --check    # just tell me
+unlp update            # download and replace the program files
+unlp restart           # run the new build
+```
+
+`update` replaces only the program (`warppool.py`, `ui.html`, the launchers).
+Your `config.json`, `state.json` and `nodes/` are never touched, and a failed
+download is rolled back rather than leaving a half-written file.
 
 - **Linux / macOS** — `~/.local/bin/unlp`. `install.sh` tells you if that is not
   on your `PATH`; add it with `export PATH="$HOME/.local/bin:$PATH"`.
@@ -213,6 +243,11 @@ endpoint that accepts a JSON `POST` works.
 
 | command             | job |
 |---------------------|-----|
+| `help`              | every command, grouped by area |
+| `version` / `update`| what you run / check for and install a newer release |
+| `pause` / `resume`  | freeze automatic rotation; the nodes stay up |
+| `restart`           | bounce the background service |
+| `uninstall`         | stop everything and remove the install |
 | `setup`             | one command: 2 answers, config + usque + nodes + (optional) UI |
 | `install`           | one command: config + usque + nodes up + self-driving rotation |
 | `init`              | headless setup (no questions) — config, usque, bring nodes up |
@@ -230,6 +265,21 @@ endpoint that accepts a JSON `POST` works.
 The old `scripts/warp_pool_watch.sh` (a 5-minute cron watchdog) still works if
 you want one, but it is no longer required — the daemon rotates on its own.
 
+## The panel
+
+Dark, dense, and keyboard-first:
+
+- **Ctrl K** (or `?`) opens the command palette — every action, filtered as you type, arrow keys + Enter.
+- `e` ensure · `r` rotate all · `p` pause · `/` filter the event log.
+- Live KPIs (nodes up, distinct addresses, drained, average age) and one card
+  per node with its egress address, age, pid and a per-node **Rotate**.
+- **Copy IP** per node, **Copy all egress IPs** from the palette.
+- Event log with a filter box; stale measurements are labelled, not disguised.
+- Toasts for command results; the header shows your version and an update
+  button when there is a newer release.
+- Reduced-motion respected, visible focus rings, real labels and `aria-live`
+  regions — it is usable with a keyboard and a screen reader.
+
 ## Configuration
 
 Everything is editable in **manage** in the UI; `config.json` is the fallback.
@@ -243,6 +293,7 @@ Everything is editable in **manage** in the UI; `config.json` is the fallback.
 | `usque_dns` | `1.1.1.1` | resolver **inside** the tunnel |
 | `usque_bin` | *(auto)* | path to `usque`, defaults to `./bin/usque(.exe)` |
 | `ui_bind` / `ui_port` | `127.0.0.1` / `8180` | where the control UI listens (`0.0.0.0` for LAN) |
+| `ui_enabled` | `true` | `false` keeps the daemon up but stops it serving the panel |
 | `webhook.url` / `.enabled` / `.min_level` | *(off)* / `false` / `warn` | alert webhook |
 | `notify_timeout_s` | `10` | webhook request timeout |
 | `nine_router.enabled` / `.base_url` / `.pool_prefix` | `false` | 9router publishing |
