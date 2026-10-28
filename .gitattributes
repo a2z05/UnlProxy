@@ -1,5 +1,7 @@
 # shell scripts and launchers must keep LF: CRLF makes `sh` fail with `\r: not found`
+# warppool.py has a shebang too, so it must survive a direct ./warppool.py on Linux
 *.sh   text eol=lf
+*.py   text eol=lf
 unlp   text eol=lf
 *.bat  text eol=crlf
 *.cmd  text eol=crlf

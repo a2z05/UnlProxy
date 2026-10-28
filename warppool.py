@@ -533,19 +533,33 @@ def status(cfg):
     return rows
 
 # ---------------------------------------------------------------- 9router
+def nine_router_dirs():
+    """Where 9router keeps machine-id and auth/cli-secret, in its own precedence:
+    DATA_DIR first (its documented override, and what a container sets), then the
+    platform default — %APPDATA%\\9router on Windows, ~/.9router elsewhere."""
+    data_dir = os.environ.get("DATA_DIR")
+    if data_dir:
+        yield data_dir
+    if WIN:
+        yield os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "9router")
+    else:
+        yield os.path.expanduser("~/.9router")
+
 def install_9r(cfg):
     n9 = cfg["nine_router"]
     if not n9.get("cli_token"):
-        # derive exactly like the box's documented 999 trigger does
-        base = None
-        for cand in ("/opt/data/.9router", os.path.expanduser("~/.9router"),
-                     os.path.join(os.environ.get("APPDATA") or "", "9router")):
-            if os.path.exists(os.path.join(cand, "machine-id")): base = cand; break
-        if base:
-            n9["cli_token"] = hashlib.sha256((open(os.path.join(base, "machine-id")).read().strip() +
-                "9r-cli-auth" + open(os.path.join(base, "auth", "cli-secret")).read().strip()
+        # derive the token 9router's own CLI derives: sha256(machine-id + salt + cli-secret)
+        for cand in nine_router_dirs():
+            mid = os.path.join(cand, "machine-id")
+            secret = os.path.join(cand, "auth", "cli-secret")
+            # both files must exist: a token derived from a missing secret is
+            # wrong, and caching it would keep it wrong for every later run
+            if not (os.path.exists(mid) and os.path.exists(secret)): continue
+            n9["cli_token"] = hashlib.sha256((
+                open(mid).read().strip() + "9r-cli-auth" + open(secret).read().strip()
                 ).encode()).hexdigest()[:16]
             save_cfg(cfg)
+            break
     hdr = {"x-9r-cli-token": n9["cli_token"], "Content-Type": "application/json"}
     base = n9["base_url"]
     st, d = http_json(cfg, base + "/api/proxy-pools", headers=hdr, timeout=10)
@@ -1039,8 +1053,11 @@ def main():
         n = uninstall(keep_config="--keep-config" in sys.argv)
         print(f"removed: {', '.join(n) or 'nothing'}")
         print(f"left in place: {HERE}" if n else HERE)
-        print("to finish: delete the 'unlp' launcher from ~/.local/bin (or %LOCALAPPDATA%)"
-              if not WIN else "to finish: delete unlp.cmd from %USERPROFILE%\\.local\\bin")
+        # the installers put `unlp` in ~/.local/bin, wherever that is on this OS
+        launcher = os.path.join(os.path.expanduser("~"), ".local", "bin",
+                                "unlp.cmd" if WIN else "unlp")
+        if os.path.exists(launcher):
+            print(f"to finish: delete the launcher at {launcher}")
         return 0
     if cmd == "cli": return cli(cfg)
     if cmd == "setup":

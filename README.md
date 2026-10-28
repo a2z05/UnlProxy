@@ -86,8 +86,10 @@ download is rolled back rather than leaving a half-written file.
 
 - **Linux / macOS** — `~/.local/bin/unlp`. `install.sh` tells you if that is not
   on your `PATH`; add it with `export PATH="$HOME/.local/bin:$PATH"`.
-- **Windows** — `unlp.cmd`, written next to your `python.exe` (so it is already
-  on `PATH`). Open a **new** terminal after installing.
+- **Windows** — `unlp.cmd` in `%USERPROFILE%\.local\bin`, which the installer
+  adds to your user `PATH`. It writes `warppool.py`'s absolute path into the
+  launcher, so it works from any directory. Open a **new** terminal after
+  installing.
 
 Every `warppool.py` subcommand works through it: `unlp serve`, `unlp daemon`,
 `unlp ensure`, `unlp install-9r`, `unlp config`. `unlp` on its own runs `ui`,
