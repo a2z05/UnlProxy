@@ -1,0 +1,22 @@
+diff --git a/src/app/api/proxy-pools/[id]/test/route.js b/src/app/api/proxy-pools/[id]/test/route.js
+index 8caa763..9fd2c2b 100644
+--- a/src/app/api/proxy-pools/[id]/test/route.js
++++ b/src/app/api/proxy-pools/[id]/test/route.js
+@@ -48,11 +48,16 @@ export async function POST(request, { params }) {
+       : await testProxyUrl({ proxyUrl: proxyPool.proxyUrl });
+     const now = new Date().toISOString();
+ 
++    // A test reports health; it does not decide whether the pool is switched on.
++    // Writing isActive here disabled a pool for good on a single transient
++    // failure (a node mid-rotation, a slow moment, an unreachable test URL):
++    // nothing re-tests automatically, so nothing ever turned it back on.
++    // isActive stays the user's switch (toggle, bulk enable/disable, the
++    // "Disable Dead Proxies" prompt in the UI); testStatus carries the verdict.
+     await updateProxyPool(id, {
+       testStatus: result.ok ? "active" : "error",
+       lastTestedAt: now,
+       lastError: result.ok ? null : (result.error || `Proxy test failed with status ${result.status}`),
+-      isActive: result.ok,
+     });
+ 
+     return NextResponse.json({
