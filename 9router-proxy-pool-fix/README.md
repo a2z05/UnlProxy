@@ -39,16 +39,33 @@ carries the verdict. `isActive` stays the user's on/off switch.
 
 ### npm / `npx` install (most common)
 
-npm ships the compiled server only, so patch the build:
+npm ships the compiled server only, so patch the build.
 
-```bash
-node apply.mjs           # finds your 9router, patches it, verifies it
-node apply.mjs --check   # is it patched?
-node apply.mjs --revert  # undo
+**Windows** — double-click `fix-9router.bat`, or from a terminal:
+
+```bat
+fix-9router.bat            :: find your 9router, patch it, verify it
+fix-9router.bat --check    :: is it patched?
+fix-9router.bat --revert   :: undo
 ```
 
+**Linux / macOS / any shell with node** — the same thing:
+
 ```bash
-node apply.mjs --dir /path/to/9router   # non-standard location
+./fix-9router.sh           # patch
+./fix-9router.sh --check   # is it patched?
+./fix-9router.sh --revert  # undo
+```
+
+Both are thin wrappers around `apply.mjs`, which is the actual implementation —
+the install-finding, matching and parse-checking are JavaScript, and a batch or
+shell re-write would be a second copy of those rules to drift out of sync.
+`node apply.mjs` directly does exactly the same thing.
+
+If your 9router is somewhere unusual:
+
+```bash
+node apply.mjs --dir /path/to/9router
 ```
 
 Then **restart 9router** so the new build is loaded.
@@ -99,6 +116,8 @@ the one statement being changed.
 
 | file | what |
 |---|---|
-| `apply.mjs` | install / check / revert, for npm installs and source checkouts |
+| `apply.mjs` | the implementation: install / check / revert, npm installs and source checkouts |
+| `fix-9router.bat` | Windows launcher — double-clickable |
+| `fix-9router.sh` | Linux / macOS launcher |
 | `9router-proxy-pool-test.patch` | `git apply`-able diff against the 9router source |
 | `README.md` | this |
